@@ -7,6 +7,13 @@ const root = path.resolve(import.meta.dirname, "..");
 const files = execFileSync("git", ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], { cwd: root }).toString().split("\0").filter(Boolean);
 if (!files.length) throw new Error("No staged files to audit. Stage the intended publish set first.");
 const localEnv = fs.existsSync(path.join(root, ".env")) ? parse(fs.readFileSync(path.join(root, ".env"))) : {};
+// Detect locally configured endpoints without embedding any organization's domains.
+const localEndpointHosts = new Set(Object.entries(localEnv).filter(([key]) => /(?:BASE_URL|ENDPOINT|HOST)$/.test(key)).flatMap(([, value]) => {
+  try {
+    const host = new URL(value).hostname.toLowerCase();
+    return /^(?:localhost|127\.0\.0\.1|\[::1\]|api\.openai\.com)$/.test(host) ? [] : [host];
+  } catch { return []; }
+}));
 const secrets = Object.entries({ ...process.env, ...localEnv }).filter(([key, value]) =>
   /(?:KEY|TOKEN|PASSWORD|SECRET|CREDENTIAL|AK)$/.test(key) && typeof value === "string" && value.length >= 8);
 const findings = [];
@@ -20,7 +27,13 @@ for (const file of files) {
   if (!/\.(?:png|jpe?g|webp|ico)$/i.test(file)) {
     const text = data.toString("utf8");
     if (/(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{25,}|sk-(?:proj|svcacct)-[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/.test(text)) findings.push({ file, reason: "credential_pattern" });
-    if (/\/Users\/[^/\s]+\//.test(text) || /https?:\/\/[^\s/]*(?:byteintl|tiktok-row)\./.test(text)) findings.push({ file, reason: "personal_path_or_internal_host" });
+    const hasPrivateEndpoint = [...text.matchAll(/https?:\/\/[^\s<>"'`]+/g)].some(([url]) => {
+      try {
+        const host = new URL(url).hostname.toLowerCase();
+        return localEndpointHosts.has(host) || /(?:^|\.)(?:internal|intranet|corp|local)$/.test(host);
+      } catch { return false; }
+    });
+    if (/\/Users\/[^/\s]+\//.test(text) || hasPrivateEndpoint) findings.push({ file, reason: "personal_path_or_internal_host" });
   }
   if (file === ".env.example") {
     for (const [key, value] of Object.entries(parse(data))) if (/(?:KEY|TOKEN|PASSWORD|SECRET|AK)$/.test(key) && value) findings.push({ file, reason: "template_secret_not_empty", variable: key });
