@@ -1,0 +1,43 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Store } from "../electron/store.mjs";
+import { DAY } from "../electron/pet.mjs";
+test("archives preserve pet identity, diary and settings across generations and reloads", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-store-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  assert.throws(() => store.nextGeneration());
+  const first = store.state.pet.id;
+  store.care("water");
+  store.state.settings.workspace = dir;
+  store.state.pet.companionMs = DAY * 180;
+  store.nextGeneration();
+  assert.equal(store.state.pet.generation, 2);
+  assert.equal(store.state.archives[0].id, first);
+  assert.notEqual(store.state.pet.id, first);
+  assert.ok(store.state.diary.some((d) => d.generation === 1));
+  const reloaded = new Store(dir);
+  assert.equal(reloaded.state.pet.generation, 2);
+  assert.equal(reloaded.state.settings.workspace, dir);
+  assert.equal(fs.statSync(path.join(dir, "state.json")).mode & 0o777, 0o600);
+});
+test("a restarted app does not pretend lost jobs are still running", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-jobs-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  store.state.tasks.push({ id: "lost", status: "running" });
+  store.save();
+  const reloaded = new Store(dir);
+  assert.equal(reloaded.state.tasks[0].status, "interrupted");
+  assert.match(reloaded.state.tasks[0].error, /重新启动/);
+});
+test("corrupted storage is preserved rather than silently overwritten", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-broken-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, "state.json"), "broken");
+  assert.throws(() => new Store(dir));
+  assert.equal(fs.readFileSync(path.join(dir, "state.json"), "utf8"), "broken");
+});
