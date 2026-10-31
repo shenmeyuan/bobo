@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { redact } from "./config.mjs";
 import { estimateTokens } from "./context-budget.mjs";
+import { memoryQueryTerms } from "./memory-query.mjs";
 
 const digest = (value) =>
   createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -242,6 +243,7 @@ export function saveProjectMemory(
     (m) =>
       m.scope.repository === scope.repository &&
       m.text === content &&
+      m.kind === kind &&
       m.status === "active",
   );
   if (existing) return existing;
@@ -270,6 +272,89 @@ export function saveProjectMemory(
   return entry;
 }
 
+export function replaceProjectMemory(
+  store,
+  workspace,
+  id,
+  { text, kind, expectedRevision, source },
+) {
+  const scope = projectScope(workspace),
+    memory = ensureWorkMemory(store.state);
+  const entry = memory.project.find(
+    (m) => m.id === id && m.scope.repository === scope?.repository,
+  );
+  if (!entry) throw new Error("这条记忆不属于当前项目。");
+  if (source?.kind !== "user_ui")
+    throw new Error("替换记忆需要你在项目记忆中明确保存。");
+  if (entry.status !== "active" || expectedRevision !== entry.revision)
+    throw new Error("这条记忆已改变，请刷新后重新编辑。");
+  kind ??= entry.kind;
+  if (
+    typeof text !== "string" ||
+    !text.trim() ||
+    text.length > 2000 ||
+    !["feedback", "preference", "reference"].includes(kind)
+  )
+    throw new Error("记忆类型需有效，正文需为 1～2000 字符。");
+  const content = redact(text.trim());
+  if (content === entry.text && kind === entry.kind) return entry;
+  if (
+    memory.project.some(
+      (m) =>
+        m.id !== id &&
+        m.scope.repository === scope.repository &&
+        m.status === "active" &&
+        m.text === content &&
+        m.kind === kind,
+    )
+  )
+    throw new Error("已有相同类型和内容的有效记忆，请先处理重复内容。");
+  const now = Date.now();
+  const replacement = {
+    id: randomUUID(),
+    revision: 1,
+    scope: { repository: scope.repository },
+    kind,
+    text: content,
+    status: "active",
+    source,
+    taskId: entry.taskId || null,
+    createdAt: now,
+    updatedAt: now,
+    trust: "user_confirmed",
+    history: [],
+    supersedes: entry.id,
+  };
+  const previousProject = memory.project;
+  const retired = {
+    ...entry,
+    status: "revoked",
+    revision: entry.revision + 1,
+    updatedAt: now,
+    supersededBy: replacement.id,
+    history: [
+      ...entry.history,
+      {
+        revision: entry.revision,
+        text: entry.text,
+        status: entry.status,
+        updatedAt: entry.updatedAt,
+      },
+    ],
+  };
+  memory.project = [
+    ...previousProject.map((m) => (m.id === entry.id ? retired : m)),
+    replacement,
+  ];
+  try {
+    store.save();
+  } catch (error) {
+    memory.project = previousProject;
+    throw error;
+  }
+  return replacement;
+}
+
 export function revokeProjectMemory(store, workspace, id) {
   const scope = projectScope(workspace),
     memory = ensureWorkMemory(store.state);
@@ -295,37 +380,83 @@ export function revokeProjectMemory(store, workspace, id) {
 export function listProjectMemories(store, workspace, query = "") {
   const scope = projectScope(workspace);
   if (!scope) return [];
-  const terms = [
-    ...new Set(
-      String(query)
-        .toLowerCase()
-        .match(/[a-z0-9_-]{2,}|[\p{Script=Han}]{2,}/gu) || [],
-    ),
-  ];
-  // Add Chinese bigrams so a full sentence isn't treated as one exact keyword.
-  for (const term of [...terms])
-    if (/\p{Script=Han}/u.test(term))
-      for (let i = 0; i < term.length - 1 && terms.length < 80; i++)
-        terms.push(term.slice(i, i + 2));
+  const terms = memoryQueryTerms(query);
   return ensureWorkMemory(store.state)
     .project.filter((m) => m.scope.repository === scope.repository)
     .map((m) => ({
       ...m,
       score: terms.filter((t) => m.text.toLowerCase().includes(t)).length,
     }))
-    .filter((m) => !query || m.score > 0 || m.kind !== "reference")
+    .filter((m) => !query || m.score > 0 || isMandatoryProjectMemory(m))
     .sort((a, b) => b.score - a.score || b.updatedAt - a.updatedAt);
 }
 
+const memoryContent = (m) => ({
+  id: m.id,
+  revision: m.revision,
+  kind: m.kind,
+  status: m.status,
+  text: m.text,
+  ...(m.supersedes ? { supersedes: m.supersedes } : {}),
+  ...(m.supersededBy ? { supersededBy: m.supersededBy } : {}),
+});
+
+export function readProjectMemory(store, workspace, id) {
+  const scope = projectScope(workspace);
+  const entry = ensureWorkMemory(store.state).project.find(
+    (m) => m.id === id && m.scope.repository === scope?.repository,
+  );
+  if (!entry) throw new Error("这条记忆不属于当前项目。");
+  return {
+    ...memoryContent(entry),
+    source: "user_confirmed_project_memory",
+    previewOnly: false,
+  };
+}
+
+export function searchProjectMemory(store, workspace, query, cursor = 0) {
+  if (typeof query !== "string" || query.length > 2000)
+    throw new Error("记忆检索最多 2000 字符。");
+  if (!Number.isSafeInteger(cursor) || cursor < 0)
+    throw new Error("记忆检索页位置需为非负整数，请沿用同一检索词翻页。");
+  const entries = listProjectMemories(store, workspace, query).filter(
+    (m) => !query.trim() || m.score > 0,
+  );
+  const packet = {
+    entries: [],
+    omitted: 0,
+    nextCursor: null,
+    source: "user_confirmed_project_memory",
+    previewOnly: true,
+    note: "仅为检索预览，使用 read_project_memory 读取完整规则；翻页需沿用同一检索词。",
+  };
+  let next = Math.min(cursor, entries.length);
+  while (next < entries.length && packet.entries.length < 8) {
+    const item = memoryContent(entries[next]);
+    item.text = Array.from(item.text).slice(0, 160).join("");
+    const candidate = {
+      ...packet,
+      entries: [...packet.entries, item],
+      omitted: entries.length - next - 1,
+      nextCursor: next + 1 < entries.length ? next + 1 : null,
+    };
+    if (estimateTokens(JSON.stringify(candidate)) > 1000) break;
+    packet.entries.push(item);
+    next++;
+  }
+  packet.omitted = entries.length - next;
+  packet.nextCursor = next < entries.length ? next : null;
+  return packet;
+}
+
+export const isMandatoryProjectMemory = (memory) =>
+  memory.status === "revoked" || memory.kind !== "reference";
+
 export function retrieveProjectMemory(store, workspace, query, budget = 1200) {
   const entries = listProjectMemories(store, workspace, query);
-  const pinned = entries.filter((m) => m.kind !== "reference");
+  const pinned = entries.filter(isMandatoryProjectMemory);
   const encode = (m) => ({
-    id: m.id,
-    revision: m.revision,
-    kind: m.kind,
-    status: m.status,
-    text: m.text,
+    ...memoryContent(m),
     trust: m.trust,
     source: m.source,
     taskId: m.taskId,
@@ -334,7 +465,7 @@ export function retrieveProjectMemory(store, workspace, query, budget = 1200) {
   const selected = pinned.map(encode);
   const mandatoryTokens = estimateTokens(JSON.stringify(selected));
   let omitted = 0;
-  for (const item of entries.filter((m) => m.kind === "reference")) {
+  for (const item of entries.filter((m) => !isMandatoryProjectMemory(m))) {
     const candidate = [...selected, encode(item)];
     if (estimateTokens(JSON.stringify(candidate)) <= budget)
       selected.push(encode(item));

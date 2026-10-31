@@ -1,14 +1,25 @@
 const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("bobo", {
+  configureObserver: (agent, enabled) =>
+    ipcRenderer.invoke("bobo:observer-configure", { agent, enabled }),
+  refreshObserver: () => ipcRenderer.invoke("bobo:observer-refresh"),
+  runTests: (id) => ipcRenderer.invoke("bobo:run-tests", id),
   getState: () => ipcRenderer.invoke("bobo:state"),
   care: (action) => ipcRenderer.invoke("bobo:care", action),
   refreshQuotas: (agent) => ipcRenderer.invoke("bobo:refresh-quotas", agent),
   newConversation: () => ipcRenderer.invoke("bobo:new-conversation"),
   selectConversation: (id) =>
     ipcRenderer.invoke("bobo:select-conversation", id),
-  chat: (message) => ipcRenderer.invoke("bobo:chat", message),
-  dispatch: (agent, title, prompt, contract) =>
-    ipcRenderer.invoke("bobo:dispatch", { agent, title, prompt, contract }),
+  chat: (message, context) =>
+    ipcRenderer.invoke("bobo:chat", { message, context }),
+  dispatch: (agent, title, prompt, contract, context) =>
+    ipcRenderer.invoke("bobo:dispatch", {
+      agent,
+      title,
+      prompt,
+      contract,
+      context,
+    }),
   cancelTask: (id) => ipcRenderer.invoke("bobo:cancel", id),
   getWorkflow: (id) => ipcRenderer.invoke("bobo:workflow", id),
   getProjectMemory: () => ipcRenderer.invoke("bobo:project-memory"),
@@ -16,6 +27,14 @@ contextBridge.exposeInMainWorld("bobo", {
     ipcRenderer.invoke("bobo:save-project-memory", { text, kind, taskId }),
   revokeProjectMemory: (id) =>
     ipcRenderer.invoke("bobo:revoke-project-memory", id),
+  replaceProjectMemory: (id, text, kind, expectedRevision, workspace) =>
+    ipcRenderer.invoke("bobo:replace-project-memory", {
+      id,
+      text,
+      kind,
+      expectedRevision,
+      workspace,
+    }),
   setContract: (id, contract) =>
     ipcRenderer.invoke("bobo:contract", { id, contract }),
   resumeTask: (id, agent, note) =>

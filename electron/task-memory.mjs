@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { loadConfig } from "./config.mjs";
+import { memoryQueryTerms } from "./memory-query.mjs";
 
 const MAX_REPORT_CHARS = 128000;
 const hash = (text) => createHash("sha256").update(text, "utf8").digest("hex");
@@ -247,9 +248,7 @@ export function selectReportExcerpts(text, query, budgetChars = 1800) {
     add(0, head);
     add(text.length - tail, text.length, text.length);
     const candidates = [];
-    const terms = [
-      ...new Set(String(query ?? "").match(/[\p{L}\p{N}_-]{2,64}/gu) || []),
-    ].slice(0, 32);
+    const terms = memoryQueryTerms(query);
     for (const term of terms) {
       const expression = new RegExp(escapeRegExp(term), "giu");
       let match;

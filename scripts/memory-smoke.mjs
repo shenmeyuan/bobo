@@ -122,15 +122,24 @@ try {
     }),
   );
   const first = await page.evaluate(() =>
-    window.bobo.dispatch(
-      "codex",
-      "长报告与版本记忆测试",
-      "交付 delivery.txt，内容必须为 done；保留既有文件名。",
-      {
-        checks: [{ kind: "contains", path: "delivery.txt", expected: "done" }],
-        maxAttempts: 3,
-        tokenLimit: null,
-      },
+    window.bobo.getState().then((requestState) =>
+      window.bobo.dispatch(
+        "codex",
+        "长报告与版本记忆测试",
+        "交付 delivery.txt，内容必须为 done；保留既有文件名。",
+        {
+          checks: [
+            { kind: "contains", path: "delivery.txt", expected: "done" },
+          ],
+          maxAttempts: 3,
+          tokenLimit: null,
+        },
+        {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        },
+      ),
     ),
   );
   await expect

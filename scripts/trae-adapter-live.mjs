@@ -11,6 +11,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-trae-adapter-")),
 fs.mkdirSync(workspace);
 const store = new Store(path.join(dir, "data"));
 store.state.settings.workspace = workspace;
+store.newConversation();
 store.state.settings.allowEdits = true;
 store.state.settings.superviseTasks = false;
 const shapes = [],

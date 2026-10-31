@@ -1,6 +1,6 @@
 {
   "name": "bobo-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "electron/main.mjs",
@@ -24,7 +24,8 @@
     "format": "prettier --write src electron scripts tests README.md *.json *.mjs",
     "eval:work-memory": "node scripts/eval-work-memory.mjs",
     "eval:project-memory": "node scripts/eval-project-memory.mjs",
-    "test:permissions": "node scripts/permission-smoke.mjs"
+    "test:permissions": "node scripts/permission-smoke.mjs",
+    "test:keeper": "node scripts/keeper-smoke.mjs"
   },
   "dependencies": {
     "dotenv": "^17.2.3",

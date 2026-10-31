@@ -10,6 +10,25 @@ import {
   selectReportExcerpts,
 } from "../electron/task-memory.mjs";
 
+for (const [query, target] of [
+  ["请查找中文接口约定并告诉我", "接口约定"],
+  ["café", "CAFÉ"],
+  ["настройка", "НАСТРОЙКА"],
+  ["カタカナ", "カタカナ"],
+]) {
+  test(`literal query recalls the middle source span: ${query}`, () => {
+    const text =
+      "opening ".repeat(600) +
+      `\n这里的${target}需要保留。\n` +
+      "ending ".repeat(600);
+    const packet = selectReportExcerpts(text, query, 200);
+    assert.ok(packet.excerpts.some((e) => e.text.includes(target)));
+    assert.ok(packet.selectedChars <= 200);
+    for (const excerpt of packet.excerpts)
+      assert.equal(excerpt.text, text.slice(excerpt.start, excerpt.end));
+  });
+}
+
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-task-memory-"));
   const previous = process.env.BOBO_ENV_PATH;

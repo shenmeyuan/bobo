@@ -10,6 +10,11 @@ import { randomUUID } from "node:crypto";
 import { newPet, advancePet, stageOf, careFor } from "./pet.mjs";
 import { createState } from "./state.mjs";
 import { ensureWorkMemory } from "./work-memory.mjs";
+import {
+  effectiveConversationScope,
+  sameConversationScope,
+} from "./conversation-scope.mjs";
+import { migrateFallbackPolicy } from "./fallback-policy.mjs";
 export { createState } from "./state.mjs";
 export class Store {
   constructor(dir, onChange = () => {}) {
@@ -17,8 +22,9 @@ export class Store {
     this.file = path.join(dir, "state.json");
     this.onChange = onChange;
     this.state = createState();
+    let saved;
     if (fs.existsSync(this.file)) {
-      const saved = JSON.parse(fs.readFileSync(this.file, "utf8"));
+      saved = JSON.parse(fs.readFileSync(this.file, "utf8"));
       if (
         saved.version !== 1 ||
         !saved.pet ||
@@ -33,7 +39,16 @@ export class Store {
         usage: { ...this.state.usage, ...saved.usage },
       };
     }
-    ensureConversations(this.state);
+    let initialScope = { kind: "legacy" };
+    if (!saved) {
+      try {
+        initialScope = effectiveConversationScope(this.state);
+      } catch {
+        /* Invalid directories stay read-only. */
+      }
+    }
+    ensureConversations(this.state, initialScope);
+    migrateFallbackPolicy(this.state, saved);
     ensureWorkMemory(this.state);
     this.state.pet = advancePet(this.state.pet);
     // A detached child may survive a crash; the supervisor checks its PID before recovery.
@@ -107,23 +122,42 @@ export class Store {
     );
     this.save();
   }
-  newConversation() {
-    const id = newConversation(this.state);
+  newConversation(scope = effectiveConversationScope(this.state)) {
+    const id = newConversation(this.state, scope);
     this.save();
     return id;
+  }
+  alignConversation() {
+    const scope = effectiveConversationScope(this.state);
+    const current = this.state.conversations.find(
+      (c) => c.id === this.state.activeConversationId,
+    );
+    if (sameConversationScope(current?.scope, scope)) return current.id;
+    const existing = [...this.state.conversations]
+      .filter((c) => sameConversationScope(c.scope, scope))
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    if (!existing) return this.newConversation(scope);
+    this.selectConversation(existing.id);
+    return existing.id;
   }
   selectConversation(id) {
     selectConversation(this.state, id);
     this.save();
   }
-  message(role, content) {
-    this.state.messages.push({
+  message(role, content, conversationId = this.state.activeConversationId) {
+    const conversation = this.state.conversations.find(
+      (c) => c.id === conversationId,
+    );
+    if (!conversation) throw new Error("这段对话不存在。");
+    conversation.messages.push({
       id: randomUUID(),
       role,
       content: content.slice(0, 16000),
       at: Date.now(),
     });
-    syncConversation(this.state);
+    if (conversationId === this.state.activeConversationId)
+      this.state.messages = conversation.messages;
+    syncConversation(this.state, conversationId);
     this.save();
   }
 }

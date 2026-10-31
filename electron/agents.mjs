@@ -1,4 +1,12 @@
 import fs from "node:fs";
+import { assertConversationScope } from "./conversation-scope.mjs";
+import {
+  automaticAgentAllowed,
+  globalFallbackAgents,
+  policy,
+  consentRequired,
+} from "./fallback-policy.mjs";
+import { runExecutableVerification } from "./executable-checks.mjs";
 import { readCodexQuota, readClaudeQuota } from "./quota.mjs";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -7,7 +15,11 @@ import { loadConfig, redact } from "./config.mjs";
 import { Supervisor, EXECUTORS } from "./supervisor.mjs";
 import { archiveTaskReport } from "./task-memory.mjs";
 import { permissionDeniedEvent } from "./agent-events.mjs";
-import { retrieveProjectMemory, syncWorkMemory } from "./work-memory.mjs";
+import {
+  retrieveProjectMemory,
+  syncWorkMemory,
+  isMandatoryProjectMemory,
+} from "./work-memory.mjs";
 import { fitContext } from "./context-budget.mjs";
 import {
   inventory,
@@ -142,6 +154,11 @@ export function parseAgentEvent(agent, event) {
             ? {
                 input: event.usage?.input_tokens || 0,
                 output: event.usage?.output_tokens || 0,
+                cacheRead:
+                  event.usage?.cached_input_tokens ||
+                  event.usage?.cache_read_input_tokens ||
+                  0,
+                cacheWrite: event.usage?.cache_creation_input_tokens || 0,
               }
             : null,
         usageRaw: event.usage || null,
@@ -183,6 +200,11 @@ export function parseAgentEvent(agent, event) {
                       (event.usage?.cache_creation_input_tokens || 0)
                     : 0),
                 output: event.usage?.output_tokens || 0,
+                cacheRead:
+                  event.usage?.cached_input_tokens ||
+                  event.usage?.cache_read_input_tokens ||
+                  0,
+                cacheWrite: event.usage?.cache_creation_input_tokens || 0,
                 cost: event.total_cost_usd ?? null,
               }
             : null,
@@ -205,6 +227,8 @@ export class AgentManager {
     this.spawnProcess = spawnProcess;
     this.quotaReads = new Map();
     this.running = new Map();
+    this.verifying = new Set();
+    this.verificationControllers = new Map();
     this.supervisor = new Supervisor(this);
   }
   async refreshQuotas(agentId, force = false) {
@@ -325,6 +349,7 @@ export class AgentManager {
     }));
   }
   dispatch(agent, title, prompt, options = {}) {
+    if (!options.parentId) assertConversationScope(this.store.state);
     if (!KNOWN.includes(agent))
       throw new Error("请选择 Trae、Codex、Claude Code 或豆包。");
     const quota = this.store.state.quotas[agent];
@@ -367,6 +392,8 @@ export class AgentManager {
       );
     if (agent !== "doubao") {
       workspace = fs.realpathSync(workspace);
+      if (this.verifying.has(workspace))
+        throw new Error("这个目录正在运行验收，请等验收结束。");
       const canonical = workspace;
       if (
         this.store.state.tasks.some(
@@ -457,9 +484,10 @@ export class AgentManager {
     if (!options.parentId && agent !== "doubao")
       task.supervision = {
         enabled: Boolean(settings.superviseTasks),
-        allowedAgents: [
-          ...new Set([agent, ...(settings.fallbackAgents || [])]),
-        ],
+        allowedAgents: [...new Set([agent, ...globalFallbackAgents(settings)])],
+        policy: policy(
+          settings.fallbackPolicy?.source === "user_ui" ? "user_ui" : "default",
+        ),
         state: settings.superviseTasks ? "watching" : "paused",
         reason: settings.superviseTasks
           ? "Bobo 正在照看；换工具仅限你勾选的接手名单。"
@@ -520,10 +548,10 @@ export class AgentManager {
       const fitted = fitContext(
         {
           prompt: executionPrompt,
-          memories: projectMemory.entries.filter((m) => m.kind !== "reference"),
+          memories: projectMemory.entries.filter(isMandatoryProjectMemory),
         },
         projectMemory.entries
-          .filter((m) => m.kind === "reference")
+          .filter((m) => !isMandatoryProjectMemory(m))
           .map((memory) => ({
             apply: (value) => {
               value.memories.push(memory);
@@ -625,6 +653,19 @@ export class AgentManager {
           syncWorkMemory(this.store, task);
         this.store.save();
       }
+      const contract = rootOf(this.store, task).contract;
+      if (update.usage && contract?.tokenLimit && task.status === "running") {
+        const report = this.report(task.id);
+        if (report.usage.total >= contract.tokenLimit) {
+          task.stopReason = "token_budget";
+          this.kill(child);
+          this.finish(
+            task,
+            "attention",
+            "已回报用量达到任务 Token 阈值，已请求停止；未回报用量可能继续产生。",
+          );
+        }
+      }
       if (update.permissionDenied && task.status === "running") {
         this.kill(child);
         this.finish(task, "attention", update.progress);
@@ -676,20 +717,6 @@ export class AgentManager {
         );
     });
     child.stdin.end(agent === "trae" ? undefined : executionPrompt);
-    task.timeout = setTimeout(() => {
-      if (task.status === "running") {
-        this.kill(child);
-        this.finish(
-          task,
-          "failed",
-          "任务超过 30 分钟，已请求停止；等待原进程退出。",
-        );
-      }
-    }, 30 * 60_000);
-    // Timers belong to the process map, not the persistent JSON state.
-    const timeout = task.timeout;
-    delete task.timeout;
-    child.boboTimeout = timeout;
     return {
       id: task.id,
       status: "running",
@@ -751,7 +778,9 @@ export class AgentManager {
       task.progress =
         task.verification.status === "passed"
           ? "执行结束，所列文件检查通过。"
-          : "执行结束，但有文件检查未通过。";
+          : task.verification.status === "needs_recheck"
+            ? "执行结束，等待你运行所列测试。"
+            : "执行结束，但有文件检查未通过。";
     }
     syncWorkMemory(this.store, task, verificationFreshness(task, contract));
     this.store.save();
@@ -785,13 +814,15 @@ export class AgentManager {
       )
     )
       throw new Error("请等执行进程退出，再调整检查条件和接续预算。");
+    if (this.verifying.has(task.workspace))
+      throw new Error("请等验收结束再修改条件。");
     root.contract = contract;
     root.memoryRevision = (root.memoryRevision || 1) + 1;
     // Preserve historical evidence; a changed contract makes it stale on read.
     this.store.save();
     return this.report(id);
   }
-  verify(id) {
+  verify(id, { execute = false } = {}) {
     const task = this.task(id),
       workspace = currentWorkspace(this.store);
     if (processAlive(task.processId)) throw new Error("原执行进程尚未退出。");
@@ -807,7 +838,34 @@ export class AgentManager {
       )
     )
       throw new Error("请等这个工作目录的执行进程退出，再核查产物。");
-    task.verification = runVerification(task, this.report(id).contract);
+    if (this.verifying.has(task.workspace))
+      throw new Error("这个目录的验收正在运行。");
+    const contract = this.report(id).contract;
+    if (execute && contract.checks.some((c) => c.kind === "node_test")) {
+      this.verifying.add(task.workspace);
+      const controller = new AbortController();
+      this.verificationControllers.set(task.workspace, controller);
+      return runExecutableVerification(task, contract, {
+        signal: controller.signal,
+      })
+        .then((result) => {
+          task.verification = result;
+          this.supervisor.verified(task, verificationFreshness(task, contract));
+          syncWorkMemory(
+            this.store,
+            task,
+            verificationFreshness(task, contract),
+          );
+          this.store.save();
+          return verificationFreshness(task, contract);
+        })
+        .finally(() => {
+          this.verifying.delete(task.workspace);
+          this.verificationControllers.delete(task.workspace);
+        });
+    }
+    task.verification = runVerification(task, contract);
+    this.supervisor.verified(task, verificationFreshness(task, contract));
     syncWorkMemory(
       this.store,
       task,
@@ -851,6 +909,14 @@ export class AgentManager {
   resume(id, agent, note = "", options = {}) {
     const task = this.task(id),
       root = rootOf(this.store, task);
+    if (
+      (options.automatic ||
+        (options.source === "model" && agent !== task.agent)) &&
+      !automaticAgentAllowed(root, agent)
+    )
+      throw consentRequired(
+        "这个工具尚未获准自动接手，请在任务照看规则中勾选；单次接续请在界面选择。",
+      );
     if (task.childId)
       return {
         id: task.childId,
@@ -929,8 +995,6 @@ export class AgentManager {
           ? "已接续，Bobo 继续照看。"
           : "已手动接续，自动恢复仍暂停。";
       }
-      if (!root.supervision.allowedAgents.includes(agent))
-        root.supervision.allowedAgents.push(agent);
       this.store.save();
     }
     return next;
@@ -960,6 +1024,8 @@ export class AgentManager {
     return { message: "已请求停止当前进程，取消后续自动恢复。" };
   }
   stopAll() {
+    for (const controller of this.verificationControllers.values())
+      controller.abort();
     this.supervisor.stop();
     for (const id of [...this.running.keys()]) this.cancel(id);
   }

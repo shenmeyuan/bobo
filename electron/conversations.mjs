@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-export function ensureConversations(state) {
+export function ensureConversations(state, initialScope = { kind: "legacy" }) {
   state.conversations ||= [];
   if (!state.conversations.length) {
     const now = Date.now();
@@ -13,10 +13,19 @@ export function ensureConversations(state) {
       createdAt: now,
       updatedAt: now,
       messages: state.messages || [],
+      scope: initialScope,
     });
     for (const task of state.tasks || [])
       task.conversationId ||= state.activeConversationId;
   }
+  for (const conversation of state.conversations)
+    if (
+      !conversation.scope ||
+      !["general", "workspace", "legacy"].includes(conversation.scope.kind) ||
+      (conversation.scope.kind === "workspace" &&
+        typeof conversation.scope.path !== "string")
+    )
+      conversation.scope = { kind: "legacy" };
   const current =
     state.conversations.find((c) => c.id === state.activeConversationId) ||
     state.conversations[0];
@@ -24,14 +33,12 @@ export function ensureConversations(state) {
   state.messages = current.messages;
 }
 
-export function syncConversation(state) {
+export function syncConversation(state, id = state.activeConversationId) {
   ensureConversations(state);
-  const current = state.conversations.find(
-    (c) => c.id === state.activeConversationId,
-  );
-  current.messages = state.messages;
+  const current = state.conversations.find((c) => c.id === id);
+  if (id === state.activeConversationId) current.messages = state.messages;
   current.title =
-    state.messages.find((m) => m.role === "user")?.content.slice(0, 32) ||
+    current.messages.find((m) => m.role === "user")?.content.slice(0, 32) ||
     "新对话";
   current.updatedAt = Date.now();
 }
@@ -45,7 +52,7 @@ export function selectConversation(state, id) {
   return id;
 }
 
-export function newConversation(state) {
+export function newConversation(state, scope = { kind: "general" }) {
   ensureConversations(state);
   const now = Date.now(),
     id = randomUUID();
@@ -55,6 +62,7 @@ export function newConversation(state) {
     createdAt: now,
     updatedAt: now,
     messages: [],
+    scope,
   });
   return selectConversation(state, id);
 }

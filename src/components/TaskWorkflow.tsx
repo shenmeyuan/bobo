@@ -78,6 +78,7 @@ export function TaskWorkflow({
                       attention: "需要你决定",
                       paused: "自动恢复已暂停",
                       done: "执行已结束",
+                      awaiting_verification: "等待验收",
                     } as Record<string, string>
                   )[report.supervision?.state || "paused"]
                 }
@@ -120,13 +121,14 @@ export function TaskWorkflow({
                 <p className="workflow-muted">
                   限额时按名单顺序接手；原 Agent
                   的暂时故障先原地恢复。暂停照看不会停止正在运行的进程。
+                  原工具固定保留；如需停止自动重试，请暂停照看。
                 </p>
                 <div className="workflow-agent-options">
                   {(["codex", "claude", "trae"] as AgentId[]).map((id) => (
                     <label key={id}>
                       <input
                         type="checkbox"
-                        disabled={busy}
+                        disabled={busy || id === report.attempts[0]?.agent}
                         checked={report.supervision!.allowedAgents.includes(id)}
                         onChange={() =>
                           void act(() =>
@@ -295,6 +297,42 @@ export function TaskWorkflow({
               ? "价格信息不全，暂不估算总费用。"
               : `已回报执行费用 $${report.usage.knownWorkerCost.toFixed(4)}`}
           </p>
+          {report.usage.ledger && (
+            <details>
+              <summary>任务用量账本</summary>
+              <p className="workflow-muted">
+                历次接续已回报{" "}
+                {report.usage.ledger.retryTokens.toLocaleString()} Token ·
+                缓存读取 {report.usage.ledger.cacheRead.toLocaleString()} ·
+                缓存写入 {report.usage.ledger.cacheWrite.toLocaleString()}
+                （缓存为输入子项，不重复累加）
+              </p>
+              <p className="workflow-muted">
+                任务跨度约 {Math.ceil(report.usage.ledger.elapsedMs / 60000)}{" "}
+                分钟；不代表人工投入时间。未报告部分保留为未知。
+              </p>
+              {report.usage.ledger.entries.map((entry, index) => (
+                <div className="usage-ledger-row" key={entry.id}>
+                  <strong>
+                    {entry.agent === "bobo"
+                      ? "Bobo 调度"
+                      : `${index + 1}. ${agentNames[entry.agent as AgentId] || entry.agent} · ${entry.kind === "retry" ? "接续" : "首次执行"}`}
+                  </strong>
+                  <span>
+                    {entry.reported
+                      ? `${entry.input.toLocaleString()} 输入 + ${entry.output.toLocaleString()} 输出 Token`
+                      : "用量未回报"}
+                    {entry.shared ? " · 多任务共享，不能跨任务重复相加" : ""}
+                  </span>
+                  <small>
+                    {entry.reportedCost === null
+                      ? "金额未知"
+                      : `执行器回报 $${entry.reportedCost.toFixed(4)}（0 不代表免费）`}
+                  </small>
+                </div>
+              ))}
+            </details>
+          )}
           {report.verification && (
             <div
               className={`workflow-verification ${report.verification.status}`}
@@ -315,8 +353,18 @@ export function TaskWorkflow({
                 {new Date(report.verification.at).toLocaleString()}
               </p>
               {report.verification.checks.map((c, i) => (
-                <p key={i}>
-                  {c.passed ? "✓" : "×"} {c.path} · {c.detail}
+                <div key={i}>
+                  <p>
+                    {c.passed ? "✓" : "×"} {c.path} · {c.detail.split("\n")[0]}
+                  </p>
+                  {c.detail.includes("\n") && (
+                    <details>
+                      <summary>查看检查输出</summary>
+                      <pre className="verification-output">
+                        {c.detail.slice(c.detail.indexOf("\n") + 1)}
+                      </pre>
+                    </details>
+                  )}
                   {!!c.dependencies?.length && (
                     <small className="workflow-file">
                       {" "}
@@ -330,7 +378,7 @@ export function TaskWorkflow({
                         .join("、")}
                     </small>
                   )}
-                </p>
+                </div>
               ))}
             </div>
           )}
@@ -398,6 +446,7 @@ export function TaskWorkflow({
               <option value="exists">文件存在</option>
               <option value="contains">包含指定内容</option>
               <option value="json">JSON 可解析</option>
+              <option value="node_test">运行 Node 测试（手动）</option>
             </select>
             {c.kind === "contains" && (
               <input
@@ -461,6 +510,40 @@ export function TaskWorkflow({
           添加文件检查
         </button>
         <label>
+          本次执行期限（分钟，留空不限时）
+          <input
+            aria-label="执行期限"
+            type="number"
+            min="1"
+            max="1440"
+            value={contract.maxDurationMinutes ?? ""}
+            onChange={(e) =>
+              edit({
+                ...contract,
+                maxDurationMinutes: e.target.value
+                  ? Number(e.target.value)
+                  : null,
+              })
+            }
+          />
+        </label>
+        <label>
+          无新输出多久提示安静状态（分钟）
+          <input
+            aria-label="安静提示间隔"
+            type="number"
+            min="1"
+            max="120"
+            value={contract.quietAfterMinutes ?? 3}
+            onChange={(e) =>
+              edit({ ...contract, quietAfterMinutes: Number(e.target.value) })
+            }
+          />
+        </label>
+        <p className="workflow-muted">
+          安静只提示，不会杀进程。执行期限是每次尝试的期限，达到后暂停并等你决定。
+        </p>
+        <label>
           最多尝试次数
           <input
             aria-label="最多尝试次数"
@@ -474,7 +557,7 @@ export function TaskWorkflow({
           />
         </label>
         <label>
-          接续前 Token 阈值（可留空）
+          任务 Token 阈值（可留空）
           <input
             aria-label="接续 Token 阈值"
             type="number"
@@ -489,7 +572,7 @@ export function TaskWorkflow({
           />
         </label>
         <p className="workflow-muted">
-          含本次在内；阈值只拦截下一次尝试，不是运行期间硬上限。设置阈值后，用量未知时会暂停接续。
+          含本次在内；收到用量报告达到阈值时请求停止，并拦截下一次尝试。不是服务端费用硬上限；用量未知时暂停接续。
         </p>
         <label>
           交接上下文预算（本地估算 Token）
@@ -529,6 +612,22 @@ export function TaskWorkflow({
           >
             核查当前产物
           </button>
+          {report?.contract.checks.some((c) => c.kind === "node_test") && (
+            <>
+              <p className="workflow-muted">
+                运行测试会以你的系统权限执行所列 .test.js / .test.mjs /
+                .test.cjs 文件，可能修改文件或访问网络；每项最多 30
+                秒。保存条件和自动检查不会执行测试。
+              </p>
+              <button
+                className="outline small"
+                disabled={busy || dirty}
+                onClick={() => void act(() => api.runTests(task.id))}
+              >
+                {busy ? "正在核查…" : "运行所列测试（执行项目代码）"}
+              </button>
+            </>
+          )}
           {report?.childId ? (
             <button
               className="outline small"

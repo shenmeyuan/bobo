@@ -169,11 +169,99 @@ test("concurrent messages cannot mix two tool loops", async (t) => {
   await first;
   assert.equal(brain.busy, false);
 });
+
+for (const change of [
+  "workspace",
+  "permission",
+  "symlink",
+  "unavailable",
+  "configured-workspace",
+]) {
+  test(`late model tools stop after ${change} changes without dispatching or saving memory`, async (t) => {
+    const f = fixture(t);
+    const base = path.dirname(f.store.file);
+    const a = path.join(base, "A"),
+      b = path.join(base, "B");
+    fs.mkdirSync(a);
+    fs.mkdirSync(b);
+    let workspace = a;
+    if (change === "symlink") {
+      workspace = path.join(base, "current");
+      fs.symlinkSync(a, workspace);
+    }
+    f.store.state.settings.workspace = workspace;
+    if (change === "configured-workspace") {
+      f.store.state.settings.workspace = "";
+      fs.appendFileSync(process.env.BOBO_ENV_PATH, `BOBO_WORKSPACE=${a}\n`);
+    }
+    f.store.state.settings.allowEdits = false;
+    f.store.newConversation();
+    let resolve, received;
+    const pending = new Promise((r) => {
+      resolve = r;
+    });
+    const ready = new Promise((r) => {
+      received = r;
+    });
+    let requests = 0;
+    const brain = new Brain(f.store, f.agents, () => ({
+      responses: {
+        create: async () => {
+          requests++;
+          received();
+          return pending;
+        },
+      },
+    }));
+    const active = brain.chat(
+      "记住：金额采用整数分。然后交给 Codex 检查 README。",
+    );
+    await ready;
+    if (change === "workspace") f.store.state.settings.workspace = b;
+    if (change === "permission") f.store.state.settings.allowEdits = true;
+    if (change === "symlink") {
+      fs.unlinkSync(workspace);
+      fs.symlinkSync(b, workspace);
+    }
+    if (change === "unavailable") fs.rmdirSync(a);
+    if (change === "configured-workspace")
+      fs.appendFileSync(process.env.BOBO_ENV_PATH, `BOBO_WORKSPACE=${b}\n`);
+    resolve({
+      output: [
+        {
+          type: "function_call",
+          call_id: "save",
+          name: "save_project_memory",
+          arguments: JSON.stringify({
+            text: "金额采用整数分",
+            kind: "feedback",
+          }),
+        },
+        {
+          type: "function_call",
+          call_id: "dispatch",
+          name: "dispatch_task",
+          arguments: JSON.stringify({
+            agent: "codex",
+            title: "检查 A",
+            prompt: "检查 A 的 README",
+          }),
+        },
+      ],
+    });
+    assert.match(await active, /项目或权限已改变/);
+    assert.equal(f.dispatches, 0);
+    assert.equal(f.store.state.workMemory.project.length, 0);
+    assert.equal(requests, 1);
+    assert.equal(brain.busy, false);
+  });
+}
 test("Chat tool loop reads result on demand, preserves tool IDs and caps output", async (t) => {
   const f = fixture(t);
   fs.appendFileSync(process.env.BOBO_ENV_PATH, "OPENAI_API_MODE=chat\n");
   f.store.state.tasks.push({
     id: "result-task",
+    conversationId: f.store.state.activeConversationId,
     status: "completed",
     result: "a".repeat(4500),
     agent: "codex",

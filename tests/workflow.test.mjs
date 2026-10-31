@@ -7,7 +7,14 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { Store } from "../electron/store.mjs";
 import { AgentManager } from "../electron/agents.mjs";
-import { safeFile, inventory, runVerification } from "../electron/workflow.mjs";
+import {
+  safeFile,
+  inventory,
+  runVerification,
+  handoffPacket,
+  continuationPrompt,
+} from "../electron/workflow.mjs";
+import { estimateTokens } from "../electron/context-budget.mjs";
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-workflow-")),
     work = path.join(dir, "workspace");
@@ -20,6 +27,7 @@ function fixture(t) {
   );
   const store = new Store(path.join(dir, "data"));
   store.state.settings.workspace = work;
+  store.newConversation();
   const children = [],
     inputs = [];
   const manager = new AgentManager(
@@ -67,6 +75,56 @@ function fixture(t) {
   };
   return { dir, work, store, manager, children, inputs, finish };
 }
+test("tight handoff budgets prefer the newest report even when stored in a different order", (t) => {
+  const f = fixture(t);
+  const old = {
+    id: "old",
+    rootId: "old",
+    agent: "codex",
+    prompt: "检查接口",
+    workspace: f.work,
+    createdAt: 1,
+    status: "failed",
+    result: "旧报告噪声 ".repeat(1000),
+    contract: { checks: [], contextTokenBudget: 32000 },
+  };
+  const newest = {
+    id: "new",
+    rootId: "old",
+    agent: "claude",
+    workspace: f.work,
+    createdAt: 2,
+    status: "failed",
+    error: "最新阻塞",
+    result: "最新阻塞：缺少接口约定。\n" + "当前观察 abc123 ".repeat(200),
+  };
+  f.store.state.tasks = [old, newest];
+  const full = handoffPacket(
+    f.store,
+    newest,
+    "继续接口核查",
+    inventory(f.work),
+  );
+  assert.equal(full.reports[0].task_id, newest.id);
+  assert.ok(full.reports[0].selectedChars > full.reports[1].selectedChars);
+  const latestOnly = structuredClone(full);
+  latestOnly.reports[1].excerpts = [];
+  latestOnly.reports[1].selectedChars = 0;
+  latestOnly.reports[1].omittedChars = latestOnly.reports[1].totalChars;
+  old.contract.contextTokenBudget =
+    estimateTokens(continuationPrompt(latestOnly)) + 1;
+  const tight = handoffPacket(
+    f.store,
+    newest,
+    "继续接口核查",
+    inventory(f.work),
+  );
+  assert.ok(tight.reports[0].excerpts.some((e) => e.text.includes("最新阻塞")));
+  assert.deepEqual(tight.reports[0].excerpts, full.reports[0].excerpts);
+  assert.equal(tight.reports[1].selectedChars, 0);
+  assert.ok(tight.reports[1].archive === null); // Legacy report remains available through task id.
+  assert.equal(tight.context_budget.overTokenTarget, false);
+});
 test("continuation preserves goal, contract, artifact changes and permissions; duplicate click reuses child", (t) => {
   const f = fixture(t);
   const contract = {
@@ -128,6 +186,32 @@ test("verification catches missing and incorrect output despite agent claiming c
   fs.writeFileSync(path.join(f.work, "data.json"), "broken");
   assert.equal(f.manager.verify(first.id).status, "failed");
   assert.equal(f.manager.task(first.id).status, "completed");
+});
+test("an explicit test run locks the workspace and contract, then exposes versioned results", async (t) => {
+  const f = fixture(t),
+    first = f.manager.dispatch("codex", "verify", "deliver");
+  f.finish(0);
+  fs.writeFileSync(
+    path.join(f.work, "delivery.test.mjs"),
+    "import assert from 'node:assert/strict'; assert.equal(2+2,4);",
+  );
+  const contract = {
+    checks: [{ kind: "node_test", path: "delivery.test.mjs", expected: "" }],
+  };
+  f.manager.setContract(first.id, contract);
+  assert.equal(f.manager.verify(first.id).status, "needs_recheck");
+  const running = f.manager.verify(first.id, { execute: true });
+  assert.throws(() => f.manager.dispatch("codex", "other", "go"), /验收/);
+  assert.throws(() => f.manager.setContract(first.id, contract), /验收/);
+  assert.throws(() => f.manager.verify(first.id), /验收/);
+  assert.equal((await running).status, "passed");
+  assert.equal(f.manager.report(first.id).supervision.reason, "所列检查通过。");
+  assert.equal(f.manager.verifying.size, 0);
+  fs.writeFileSync(
+    path.join(f.work, "delivery.test.mjs"),
+    "throw Error('changed');",
+  );
+  assert.equal(f.manager.report(first.id).verification.status, "stale");
 });
 test("budget gates account for failed attempts and coordination, unknown consumption blocks bounded continuation", (t) => {
   const f = fixture(t);
@@ -216,6 +300,9 @@ test("manual continuation notes survive repeated handoffs, automatic retry instr
   f.finish(0, "阶段一");
   const b = f.manager.resume(a.id, "codex", "金额按分保存");
   f.finish(1, "阶段二");
+  f.manager.supervisor.configure(a.id, true, ["codex", "claude"], {
+    source: "user_ui",
+  });
   const c = f.manager.resume(b.id, "claude", "恢复自动指令", {
     automatic: true,
   });

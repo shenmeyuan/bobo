@@ -4,11 +4,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { AgentManager } from "../electron/agents.mjs";
 import { Store } from "../electron/store.mjs";
 import { Brain, executeTool } from "../electron/brain.mjs";
 import {
   projectScope,
   saveProjectMemory,
+  replaceProjectMemory,
+  searchProjectMemory,
+  readProjectMemory,
   revokeProjectMemory,
   retrieveProjectMemory,
   listProjectMemories,
@@ -23,16 +29,29 @@ import {
   validateContract,
   runVerification,
   verificationFreshness,
+  handoffPacket,
+  inventory,
 } from "../electron/workflow.mjs";
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-work-memory-"));
+  const previousEnv = process.env.BOBO_ENV_PATH;
+  process.env.BOBO_ENV_PATH = path.join(dir, ".env");
+  fs.writeFileSync(
+    process.env.BOBO_ENV_PATH,
+    "OPENAI_API_KEY=sk-local-memory-fixture\n",
+  );
+  t.after(() => {
+    if (previousEnv === undefined) delete process.env.BOBO_ENV_PATH;
+    else process.env.BOBO_ENV_PATH = previousEnv;
+  });
   const work = path.join(dir, "project"),
     other = path.join(dir, "other");
   fs.mkdirSync(work);
   fs.mkdirSync(other);
   const store = new Store(path.join(dir, "data"));
   store.state.settings.workspace = work;
+  store.newConversation();
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return { dir, work, other, store };
 }
@@ -68,6 +87,273 @@ test("project memory deduplicates, isolates projects, and persists explicit revo
   assert.equal(
     listProjectMemories(restarted, f.work)[0].history[0].status,
     "active",
+  );
+});
+
+test("explicit replacement is revision-checked and atomic at the active limit; restart preserves lineage", (t) => {
+  const f = fixture(t);
+  const old = saveProjectMemory(f.store, f.work, {
+    text: "金额采用浮点数",
+    source: userSource,
+  });
+  // Existing v1 data has no optional replacement fields.
+  const restarted = new Store(path.dirname(f.store.file));
+  for (let i = 1; i < 100; i++)
+    saveProjectMemory(restarted, f.work, {
+      text: `规则 ${i}`,
+      source: userSource,
+    });
+  const before = JSON.stringify(restarted.state.workMemory);
+  let saves = 0;
+  const save = restarted.save.bind(restarted);
+  restarted.save = () => {
+    saves++;
+    save();
+  };
+  const replacement = {
+    text: "金额采用整数分",
+    expectedRevision: 1,
+    source: userSource,
+  };
+  assert.throws(
+    () => replaceProjectMemory(restarted, f.other, old.id, replacement),
+    /不属于/,
+  );
+  assert.throws(
+    () =>
+      replaceProjectMemory(restarted, f.work, old.id, {
+        ...replacement,
+        expectedRevision: 9,
+      }),
+    /已改变/,
+  );
+  assert.throws(
+    () =>
+      replaceProjectMemory(restarted, f.work, old.id, {
+        ...replacement,
+        text: "规则 1",
+      }),
+    /相同/,
+  );
+  assert.throws(
+    () =>
+      replaceProjectMemory(restarted, f.work, old.id, {
+        ...replacement,
+        source: { kind: "user_message" },
+      }),
+    /明确/,
+  );
+  assert.equal(JSON.stringify(restarted.state.workMemory), before);
+  assert.equal(saves, 0);
+  const next = replaceProjectMemory(restarted, f.work, old.id, replacement);
+  assert.equal(saves, 1);
+  assert.equal(next.supersedes, old.id);
+  assert.equal(
+    listProjectMemories(restarted, f.work).filter((m) => m.status === "active")
+      .length,
+    100,
+  );
+  const reloaded = new Store(path.dirname(f.store.file));
+  const previous = readProjectMemory(reloaded, f.work, old.id);
+  assert.equal(previous.status, "revoked");
+  assert.equal(previous.text, old.text);
+  assert.equal(previous.revision, 2);
+  assert.equal(previous.supersededBy, next.id);
+  const recalled = retrieveProjectMemory(reloaded, f.work, "金额").entries;
+  assert.ok(recalled.some((m) => m.id === next.id && m.supersedes === old.id));
+  revokeProjectMemory(reloaded, f.work, next.id);
+  assert.equal(readProjectMemory(reloaded, f.work, old.id).status, "revoked");
+  assert.equal(readProjectMemory(reloaded, f.work, next.id).status, "revoked");
+});
+
+test("memory dedup respects kind and identical replacement is a no-op", (t) => {
+  const f = fixture(t);
+  const rule = saveProjectMemory(f.store, f.work, {
+    text: "中文输出",
+    source: userSource,
+  });
+  const reference = saveProjectMemory(f.store, f.work, {
+    text: "中文输出",
+    kind: "reference",
+    source: userSource,
+  });
+  assert.notEqual(rule.id, reference.id);
+  const before = JSON.stringify(f.store.state.workMemory);
+  assert.equal(
+    replaceProjectMemory(f.store, f.work, rule.id, {
+      text: rule.text,
+      expectedRevision: 1,
+      source: userSource,
+    }).id,
+    rule.id,
+  );
+  assert.equal(JSON.stringify(f.store.state.workMemory), before);
+});
+
+test("replacement restores the old rule and links if saving fails", (t) => {
+  const f = fixture(t);
+  const entry = saveProjectMemory(f.store, f.work, {
+    text: "原规则",
+    source: userSource,
+  });
+  const before = JSON.stringify(f.store.state.workMemory),
+    disk = fs.readFileSync(f.store.file, "utf8");
+  f.store.save = () => {
+    throw new Error("mock disk full");
+  };
+  assert.throws(
+    () =>
+      replaceProjectMemory(f.store, f.work, entry.id, {
+        text: "新规则",
+        source: userSource,
+        expectedRevision: 1,
+      }),
+    /disk full/,
+  );
+  assert.equal(JSON.stringify(f.store.state.workMemory), before);
+  assert.equal(fs.readFileSync(f.store.file, "utf8"), disk);
+});
+
+test("revoked references survive unrelated queries and budgets in Brain, dispatch and native handoff", async (t) => {
+  const f = fixture(t);
+  const previous = saveProjectMemory(f.store, f.work, {
+    text: "旧参考约定".repeat(300),
+    kind: "reference",
+    source: userSource,
+  });
+  const next = replaceProjectMemory(f.store, f.work, previous.id, {
+    text: "新规则",
+    kind: "feedback",
+    source: userSource,
+    expectedRevision: 1,
+  });
+  const tiny = retrieveProjectMemory(f.store, f.work, "unrelated", 1);
+  assert.equal(tiny.overBudget, true);
+  const assertRevoked = (entries) =>
+    assert.ok(
+      entries.some(
+        (m) =>
+          m.id === previous.id &&
+          m.status === "revoked" &&
+          m.text === previous.text &&
+          m.supersededBy === next.id,
+      ),
+    );
+  assertRevoked(tiny.entries);
+  let instructions;
+  const brain = new Brain(f.store, { list: () => [] }, () => ({
+    responses: {
+      create: async (r) => {
+        instructions = r.instructions;
+        return { output: [], output_text: "收到" };
+      },
+    },
+  }));
+  await brain.chat("unrelated");
+  assert.match(instructions, new RegExp(previous.id));
+  assert.match(instructions, /"status":"revoked"/);
+  let spawned = 0,
+    input = "",
+    child;
+  const manager = new AgentManager(
+    f.store,
+    () => {},
+    () => {
+      spawned++;
+      child = new EventEmitter();
+      child.stdin = new PassThrough();
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      child.kill = () => {};
+      child.stdin.on("data", (chunk) => {
+        input += chunk;
+      });
+      return child;
+    },
+  );
+  fs.appendFileSync(
+    process.env.BOBO_ENV_PATH,
+    `BOBO_CODEX_PATH=${process.execPath}\n`,
+  );
+  t.after(() => manager.stopAll());
+  const blocked = manager.dispatch("codex", "检查", "unrelated", {
+    contract: { checks: [], contextTokenBudget: 512 },
+  });
+  assert.equal(blocked.status, "attention");
+  assert.equal(spawned, 0);
+  manager.dispatch("codex", "检查", "unrelated", {
+    contract: { checks: [], contextTokenBudget: 8000 },
+  });
+  assert.equal(spawned, 1);
+  assert.match(input, new RegExp(previous.id));
+  assert.ok(input.includes(previous.text));
+  child.emit("close", 1);
+  const task = f.store.state.tasks[0];
+  task.contract.contextTokenBudget = 512;
+  const native = handoffPacket(f.store, task, "unrelated", inventory(f.work), {
+    native: true,
+  });
+  assertRevoked(native.project_memory);
+  assert.equal(native.context_budget.overTokenTarget, true);
+});
+
+test("search returns bounded previews and pages without histories; explicit reads are project scoped", (t) => {
+  const f = fixture(t);
+  const saved = [];
+  for (let i = 0; i < 14; i++) {
+    const entry = saveProjectMemory(f.store, f.work, {
+      text: `中文接口 ${i}：` + "必须保留完整规则正文。".repeat(100),
+      source: userSource,
+    });
+    entry.history.push({
+      text: "HISTORY-SECRET-SENTINEL".repeat(1000),
+      status: "active",
+    });
+    saved.push(entry);
+  }
+  const ids = new Set();
+  let cursor = 0;
+  do {
+    const packet = searchProjectMemory(
+      f.store,
+      f.work,
+      "请查中文接口约定",
+      cursor,
+    );
+    const encoded = JSON.stringify(packet);
+    assert.ok(estimateTokens(encoded) <= 1000);
+    assert.ok(packet.entries.length > 0 && packet.entries.length <= 8);
+    assert.equal(packet.previewOnly, true);
+    assert.doesNotMatch(
+      encoded,
+      /HISTORY-SECRET-SENTINEL|history|repository|user_ui/,
+    );
+    for (const entry of packet.entries) {
+      assert.ok(!ids.has(entry.id));
+      ids.add(entry.id);
+      assert.ok(Array.from(entry.text).length <= 160);
+    }
+    if (packet.nextCursor !== null) assert.ok(packet.nextCursor > cursor);
+    cursor = packet.nextCursor;
+  } while (cursor !== null);
+  assert.equal(ids.size, 14);
+  assert.deepEqual(
+    searchProjectMemory(f.store, f.work, "completely-unrelated").entries,
+    [],
+  );
+  assert.throws(
+    () => searchProjectMemory(f.store, f.work, "中文", -1),
+    /非负整数/,
+  );
+  const full = executeTool(f.store, null, "read_project_memory", {
+    memory_id: saved[0].id,
+  });
+  assert.equal(full.text, saved[0].text);
+  assert.equal(full.previewOnly, false);
+  assert.ok(!JSON.stringify(full).includes("HISTORY-SECRET-SENTINEL"));
+  assert.throws(
+    () => readProjectMemory(f.store, f.other, saved[0].id),
+    /不属于/,
   );
 });
 

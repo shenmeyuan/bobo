@@ -1,6 +1,10 @@
 import type { BoboAPI, State } from "./types";
 import { createState } from "../../electron/state.mjs";
 import { advancePet, careFor, stageOf } from "../../electron/pet.mjs";
+import {
+  migrateFallbackPolicy,
+  policy,
+} from "../../electron/fallback-policy.mjs";
 const key = "bobo-browser-preview-v1";
 function initial(): State {
   const base = createState();
@@ -10,7 +14,7 @@ function initial(): State {
   } catch {
     saved = null;
   }
-  return {
+  const state = {
     ...base,
     ...(saved || {}),
     settings: { ...base.settings, ...saved?.settings },
@@ -66,6 +70,27 @@ function initial(): State {
     desktop: false,
     workspace: "",
   } as State;
+  if (!state.conversations?.length) {
+    const id = crypto.randomUUID();
+    state.conversations = [
+      {
+        id,
+        title: "新对话",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        messages: state.messages,
+        scope: { kind: saved ? "legacy" : "general" },
+      },
+    ];
+    state.activeConversationId = id;
+  }
+  for (const conversation of state.conversations)
+    conversation.scope ||= { kind: "legacy" };
+  state.messages =
+    state.conversations.find((c) => c.id === state.activeConversationId)
+      ?.messages || [];
+  migrateFallbackPolicy(state, saved);
+  return state;
 }
 function previewAPI(): BoboAPI {
   let state = initial();
@@ -78,6 +103,17 @@ function previewAPI(): BoboAPI {
   };
   return {
     async getState() {
+      const current = state.conversations?.find(
+        (c) => c.id === state.activeConversationId,
+      );
+      state.conversationContext = {
+        scope: { kind: "general" },
+        canSend: current?.scope?.kind === "general",
+        reason:
+          current?.scope?.kind === "general"
+            ? ""
+            : "仅查看；请在当前项目新建对话。",
+      };
       state.pet = advancePet(state.pet);
       state.agents = state.agents.map((a) => ({
         ...a,
@@ -108,6 +144,9 @@ function previewAPI(): BoboAPI {
       change();
       return result.text;
     },
+    configureObserver: unavailable,
+    refreshObserver: unavailable,
+    runTests: unavailable,
     refreshQuotas: unavailable,
     async newConversation() {
       state.conversations ||= [
@@ -117,6 +156,7 @@ function previewAPI(): BoboAPI {
           createdAt: Date.now(),
           updatedAt: Date.now(),
           messages: state.messages,
+          scope: { kind: "legacy" },
         },
       ];
       const id = crypto.randomUUID();
@@ -126,6 +166,7 @@ function previewAPI(): BoboAPI {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         messages: [],
+        scope: { kind: "general" },
       });
       state.activeConversationId = id;
       state.messages = [];
@@ -139,7 +180,18 @@ function previewAPI(): BoboAPI {
       state.messages = next.messages;
       change();
     },
-    async chat(content) {
+    async chat(content, context) {
+      if (
+        context.conversationId !== state.activeConversationId ||
+        context.scope?.kind !== "general" ||
+        context.allowEdits !== state.settings.allowEdits
+      )
+        throw new Error("项目、对话或权限已改变，请重新发起。");
+      if (
+        state.conversations?.find((c) => c.id === state.activeConversationId)
+          ?.scope?.kind !== "general"
+      )
+        throw new Error("这段历史仅供查看；请新建对话。");
       const answer =
         "这里是小屋的浏览器预览。桌面应用配置 Key 后，我就能和你聊天、帮你调度 Agent。现在也可以摸摸我、浇一点水。";
       state.messages.push(
@@ -170,6 +222,7 @@ function previewAPI(): BoboAPI {
     getProjectMemory: unavailable,
     saveProjectMemory: unavailable,
     revokeProjectMemory: unavailable,
+    replaceProjectMemory: unavailable,
     setContract: unavailable,
     resumeTask: unavailable,
     setSupervision: unavailable,
@@ -181,6 +234,10 @@ function previewAPI(): BoboAPI {
     pickEnvFile: unavailable,
     async setSettings(settings) {
       state.settings = { ...state.settings, ...settings };
+      if (settings.fallbackAgents)
+        state.settings.fallbackPolicy = policy("user_ui");
+      if (settings.dismissFallbackMigration && state.settings.fallbackMigration)
+        state.settings.fallbackMigration.dismissed = true;
       change();
     },
     async setQuota(agent, quota) {

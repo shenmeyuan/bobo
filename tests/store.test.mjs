@@ -5,8 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { Store } from "../electron/store.mjs";
 import { DAY } from "../electron/pet.mjs";
+function isolateConfig(t, dir) {
+  const previous = process.env.BOBO_ENV_PATH;
+  process.env.BOBO_ENV_PATH = path.join(dir, ".env");
+  fs.writeFileSync(process.env.BOBO_ENV_PATH, "OPENAI_API_KEY=sk-local-store-only\n");
+  t.after(() => {
+    if (previous === undefined) delete process.env.BOBO_ENV_PATH;
+    else process.env.BOBO_ENV_PATH = previous;
+  });
+}
 test("archives preserve pet identity, diary and settings across generations and reloads", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-store-"));
+  isolateConfig(t, dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = new Store(dir);
   assert.throws(() => store.nextGeneration());
@@ -26,6 +36,7 @@ test("archives preserve pet identity, diary and settings across generations and 
 });
 test("a restarted app does not pretend lost jobs are still running", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-jobs-"));
+  isolateConfig(t, dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = new Store(dir);
   store.state.tasks.push({ id: "lost", status: "running" });
@@ -36,6 +47,7 @@ test("a restarted app does not pretend lost jobs are still running", (t) => {
 });
 test("corrupted storage is preserved rather than silently overwritten", (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-broken-"));
+  isolateConfig(t, dir);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   fs.writeFileSync(path.join(dir, "state.json"), "broken");
   assert.throws(() => new Store(dir));

@@ -1,8 +1,15 @@
 import { rootOf } from "./workflow.mjs";
+import {
+  automaticAgentAllowed,
+  policy,
+  consentRequired,
+} from "./fallback-policy.mjs";
 
 export const EXECUTORS = ["trae", "codex", "claude"];
 export function failureKind(task) {
   if (task.status === "cancelled") return "cancelled";
+  if (["deadline", "token_budget"].includes(task.stopReason))
+    return task.stopReason;
   if (task.contextMemory?.overTokenTarget) return "context_budget";
   if (task.status === "attention") return "permission";
   const error = String(task.error || "");
@@ -84,6 +91,28 @@ export class Supervisor {
     this.store.save();
     this.manager.onComplete(task, text);
   }
+  verified(task, verification) {
+    const root = rootOf(this.store, task),
+      state = root.supervision;
+    if (
+      !state?.enabled ||
+      state.pending ||
+      task.childId ||
+      task.status !== "completed"
+    )
+      return;
+    state.state = ["passed", "not_configured"].includes(verification?.status)
+      ? "done"
+      : "awaiting_verification";
+    state.reason =
+      verification?.status === "passed"
+        ? "所列检查通过。"
+        : verification?.status === "not_configured"
+          ? "执行结束；没有配置完整验收条件。"
+          : verification?.status === "failed"
+            ? "有检查未通过，等待你决定下一步。"
+            : "执行结束；所列检查需要你手动运行或重新核查。";
+  }
   settle(task) {
     const root = rootOf(this.store, task),
       state = root.supervision;
@@ -108,10 +137,7 @@ export class Supervisor {
     if (task.status === "completed" && task.verification?.status !== "failed") {
       state.state = "done";
       state.pending = null;
-      state.reason =
-        task.verification?.status === "passed"
-          ? "所列检查通过。"
-          : "执行结束；没有配置完整验收条件。";
+      this.verified(task, task.verification || { status: "not_configured" });
       this.event(root, task, "done", state.reason);
       this.store.save();
       return false;
@@ -119,15 +145,23 @@ export class Supervisor {
     const kind = failureKind(task),
       report = this.manager.report(task.id);
     task.failureKind = kind;
-    if (kind === "permission" || kind === "unknown" || kind === "context_budget") {
+    if (["deadline", "token_budget"].includes(kind)) {
+      this.attention(root, task, task.error);
+      return true;
+    }
+    if (
+      kind === "permission" ||
+      kind === "unknown" ||
+      kind === "context_budget"
+    ) {
       this.attention(
         root,
         task,
         kind === "context_budget"
           ? "上下文预算不足，执行器尚未启动；请拆分任务或调整交接上下文预算。"
           : kind === "permission"
-          ? "任务需要登录、权限或你的决定；Bobo 已停止自动恢复。"
-          : "任务停止，但原因尚不明确；Bobo 没有盲目重试。",
+            ? "任务需要登录、权限或你的决定；Bobo 已停止自动恢复。"
+            : "任务停止，但原因尚不明确；Bobo 没有盲目重试。",
       );
       return true;
     }
@@ -155,7 +189,10 @@ export class Supervisor {
         lineage.filter((t) => t.failureKind === "quota").map((t) => t.agent),
       );
       target = state.allowedAgents.find(
-        (id) => available.includes(id) && !exhausted.has(id),
+        (id) =>
+          automaticAgentAllowed(root, id) &&
+          available.includes(id) &&
+          !exhausted.has(id),
       );
       if (!target) {
         this.attention(
@@ -165,6 +202,14 @@ export class Supervisor {
         );
         return true;
       }
+    }
+    if (!automaticAgentAllowed(root, target)) {
+      this.attention(
+        root,
+        task,
+        "当前工具没有自动接续授权，请在照看规则中选择。",
+      );
+      return true;
     }
     const reason =
       kind === "quota"
@@ -189,8 +234,21 @@ export class Supervisor {
     let changed = false;
     for (const task of this.store.state.tasks) {
       if (task.status === "running" && this.manager.running.has(task.id)) {
+        const contract = rootOf(this.store, task).contract;
+        const deadline = contract?.maxDurationMinutes;
+        if (deadline && this.now() - task.createdAt >= deadline * 60000) {
+          task.stopReason = "deadline";
+          this.manager.kill(this.manager.running.get(task.id));
+          this.manager.finish(
+            task,
+            "attention",
+            "已达到用户设置的本次执行期限，已请求停止，等待原进程退出。",
+          );
+          continue;
+        }
         const quiet =
-          this.now() - (task.lastActivityAt || task.createdAt) > 180000;
+          this.now() - (task.lastActivityAt || task.createdAt) >
+          (contract?.quietAfterMinutes ?? 3) * 60000;
         if (Boolean(task.quiet) !== quiet) {
           task.quiet = quiet;
           changed = true;
@@ -209,6 +267,10 @@ export class Supervisor {
       )
         continue;
       const task = this.manager.task(pending.taskId);
+      if (!automaticAgentAllowed(root, pending.target)) {
+        this.attention(root, task, "接手授权已改变，已取消排队的自动接续。");
+        continue;
+      }
       if (task.childId) {
         state.pending = null;
         state.state = "watching";
@@ -245,7 +307,7 @@ export class Supervisor {
       }
     }
   }
-  configure(id, enabled, allowedAgents) {
+  configure(id, enabled, allowedAgents, { source = "user_ui" } = {}) {
     const task = this.manager.task(id),
       root = rootOf(this.store, task);
     if (enabled && !this.store.state.settings.superviseTasks)
@@ -259,10 +321,17 @@ export class Supervisor {
       allowedAgents.some((a) => !EXECUTORS.includes(a))
     )
       throw new Error("请选择可以接手的 Agent。");
+    const approved = [...new Set([root.agent, ...allowedAgents])];
+    if (
+      source !== "user_ui" &&
+      approved.some((agent) => !automaticAgentAllowed(root, agent))
+    )
+      throw consentRequired("新增接手工具需要你在任务照看规则中勾选。");
     root.supervision ||= { events: [] };
     Object.assign(root.supervision, {
       enabled,
-      allowedAgents: [...new Set(allowedAgents)],
+      allowedAgents: approved,
+      policy: policy(source === "user_ui" ? "user_ui" : "model"),
       pending: null,
       state: enabled ? "watching" : "paused",
       reason: enabled ? "Bobo 正在照看这项工作。" : "已暂停自动恢复。",

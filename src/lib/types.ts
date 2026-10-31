@@ -88,11 +88,13 @@ export interface Task {
 }
 export interface TaskContract {
   checks: {
-    kind: "exists" | "contains" | "json";
+    kind: "exists" | "contains" | "json" | "node_test";
     path: string;
     expected: string;
     dependencies?: string[];
   }[];
+  maxDurationMinutes?: number | null;
+  quietAfterMinutes?: number;
   maxAttempts: number;
   tokenLimit: number | null;
   contextTokenBudget?: number;
@@ -105,6 +107,8 @@ export interface ProjectMemoryEntry {
   status: "active" | "revoked";
   source: { kind: string; messageId?: string };
   updatedAt: number;
+  supersedes?: string;
+  supersededBy?: string;
 }
 export interface WorkflowReport {
   memory: {
@@ -156,6 +160,26 @@ export interface WorkflowReport {
   contract: TaskContract;
   attempts: { id: string; agent: AgentId; status: Task["status"] }[];
   usage: {
+    ledger?: {
+      entries: {
+        id: string;
+        kind: string;
+        agent: string;
+        input: number;
+        output: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        reported: boolean;
+        reportedCost: number | null;
+        shared?: boolean;
+        durationMs?: number;
+      }[];
+      retryTokens: number;
+      cacheRead: number;
+      cacheWrite: number;
+      elapsedMs: number;
+      complete: boolean;
+    };
     input: number;
     output: number;
     brainInput: number;
@@ -188,7 +212,30 @@ export interface WorkflowReport {
     }[];
   } | null;
 }
+export interface ObservedSession {
+  id: string;
+  sessionId: string;
+  agent: "claude" | "codex";
+  title: string;
+  workspace: string;
+  status: string;
+  source: string;
+  updatedAt: number;
+  checkedAt: number;
+  event?: string;
+}
 export interface State {
+  conversationContext?: {
+    scope: ConversationScope | null;
+    canSend: boolean;
+    reason: string;
+  };
+  observer?: {
+    claudeEnabled: boolean;
+    codexEnabled: boolean;
+    sessions: ObservedSession[];
+    errors: Record<string, string>;
+  };
   pet: Pet;
   archives: (Pet & { endedAt: number })[];
   diary: Moment[];
@@ -201,6 +248,7 @@ export interface State {
     createdAt: number;
     updatedAt: number;
     messages: Message[];
+    scope?: ConversationScope;
   }[];
   quotas: Partial<Record<AgentId, Quota>>;
   usage: { brainInput: number; brainOutput: number; brainCalls: number };
@@ -209,6 +257,13 @@ export interface State {
     allowEdits: boolean;
     superviseTasks: boolean;
     fallbackAgents: AgentId[];
+    fallbackPolicy?: { version: number; source: string; updatedAt: number };
+    fallbackMigration?: {
+      previousAgents: string[];
+      resetTasks: number;
+      at: number;
+      dismissed: boolean;
+    };
     quiet: boolean;
     alwaysOnTop: boolean;
     petVisible: boolean;
@@ -232,15 +287,27 @@ export interface State {
   desktop: boolean;
   workspace: string;
 }
+export type ConversationScope =
+  | { kind: "workspace"; path: string }
+  | { kind: "general" }
+  | { kind: "legacy" };
 export interface PetNotice {
   message: string;
   taskId: string;
   at: number;
 }
+export interface RequestContext {
+  conversationId: string | undefined;
+  scope: ConversationScope | null | undefined;
+  allowEdits: boolean;
+}
 export interface BoboAPI {
   getState(): Promise<State>;
+  configureObserver(agent: "claude" | "codex", enabled: boolean): Promise<void>;
+  refreshObserver(): Promise<void>;
+  runTests(id: string): Promise<WorkflowReport["verification"]>;
   care(action: CareAction): Promise<string>;
-  chat(message: string): Promise<string>;
+  chat(message: string, context: RequestContext): Promise<string>;
   refreshQuotas(agent?: AgentId): Promise<Agent[]>;
   newConversation(): Promise<string>;
   selectConversation(id: string): Promise<void>;
@@ -248,7 +315,8 @@ export interface BoboAPI {
     agent: AgentId,
     title: string,
     prompt: string,
-    contract?: TaskContract,
+    contract: TaskContract | undefined,
+    context: RequestContext,
   ): Promise<{ id: string; status: string }>;
   cancelTask(id: string): Promise<void>;
   getWorkflow(id: string): Promise<WorkflowReport>;
@@ -259,6 +327,13 @@ export interface BoboAPI {
     taskId?: string,
   ): Promise<ProjectMemoryEntry>;
   revokeProjectMemory(id: string): Promise<ProjectMemoryEntry>;
+  replaceProjectMemory(
+    id: string,
+    text: string,
+    kind: ProjectMemoryEntry["kind"],
+    expectedRevision: number,
+    workspace: string,
+  ): Promise<ProjectMemoryEntry>;
   setContract(id: string, contract: TaskContract): Promise<WorkflowReport>;
   resumeTask(
     id: string,
@@ -278,7 +353,11 @@ export interface BoboAPI {
   verifyTask(id: string): Promise<WorkflowReport["verification"]>;
   handoff(id: string): Promise<void>;
   completeHandoff(id: string, result: string): Promise<void>;
-  setSettings(settings: Partial<State["settings"]>): Promise<void>;
+  setSettings(
+    settings: Partial<State["settings"]> & {
+      dismissFallbackMigration?: boolean;
+    },
+  ): Promise<void>;
   pickEnvFile(): Promise<State["brain"]>;
   pickWorkspace(): Promise<string>;
   setQuota(agent: AgentId, quota: Partial<Quota>): Promise<void>;

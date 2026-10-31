@@ -100,22 +100,29 @@ try {
   });
 
   const job = await pet.evaluate(() =>
-    window.bobo.dispatch(
-      "codex",
-      "CSV 汇总 · 演示任务",
-      "汇总 input.csv，交付 summary.json；保留原始数据，金额使用整数分。",
-      {
-        checks: [
-          {
-            kind: "json",
-            path: "summary.json",
-            expected: "",
-            dependencies: ["input.csv"],
-          },
-        ],
-        maxAttempts: 3,
-        tokenLimit: null,
-      },
+    window.bobo.getState().then((requestState) =>
+      window.bobo.dispatch(
+        "codex",
+        "CSV 汇总 · 演示任务",
+        "汇总 input.csv，交付 summary.json；保留原始数据，金额使用整数分。",
+        {
+          checks: [
+            {
+              kind: "json",
+              path: "summary.json",
+              expected: "",
+              dependencies: ["input.csv"],
+            },
+          ],
+          maxAttempts: 3,
+          tokenLimit: null,
+        },
+        {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        },
+      ),
     ),
   );
   await expect

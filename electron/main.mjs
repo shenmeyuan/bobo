@@ -19,8 +19,15 @@ import { Store } from "./store.mjs";
 import { AgentManager } from "./agents.mjs";
 import { Brain } from "./brain.mjs";
 import {
+  conversationContext,
+  assertRequestContext,
+} from "./conversation-scope.mjs";
+import { policy } from "./fallback-policy.mjs";
+import { SessionObserver } from "./session-observer.mjs";
+import {
   listProjectMemories,
   saveProjectMemory,
+  replaceProjectMemory,
   revokeProjectMemory,
 } from "./work-memory.mjs";
 import { ROOT, loadConfig, publicConfig, redact } from "./config.mjs";
@@ -28,7 +35,7 @@ app.setName("Bobo");
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const DEV_URL = process.env.BOBO_DEV_URL;
 const isTest = process.env.BOBO_TEST === "1";
-let home, pet, tray, store, agents, brain, timer;
+let home, pet, tray, store, agents, brain, timer, observer;
 let petOpenRequest = 0;
 let petExpanded = false,
   petTaskId = null,
@@ -91,10 +98,40 @@ else {
         store.save();
       }
       nativeTheme.themeSource = "dark";
+      // Empty fresh chats may be aligned after the saved env selection takes effect.
+      const initialChat = store.state.conversations.find(
+        (c) => c.id === store.state.activeConversationId,
+      );
+      if (
+        initialChat?.scope?.kind !== "legacy" &&
+        !initialChat?.messages.length
+      ) {
+        try {
+          store.alignConversation();
+        } catch {
+          /* The composer exposes the inaccessible directory. */
+        }
+      }
       const iconFile = path.join(directory, "assets/icon.png");
       if (process.platform === "darwin" && fs.existsSync(iconFile))
         app.dock?.setIcon(iconFile);
       brain = new Brain(store, agents);
+      observer = new SessionObserver(store, {
+        onNotice(session) {
+          const message = `${session.agent === "claude" ? "CC" : "Codex"} 的「${session.title}」正在等待你处理，请回原工具查看。`;
+          petNotice = { message, taskId: "", at: Date.now() };
+          pet?.webContents.send("bobo:pet-message", petNotice);
+          if (
+            !store.state.settings.quiet &&
+            !isTest &&
+            Notification.isSupported()
+          )
+            new Notification({ title: "Bobo 提醒你", body: message })
+              .on("click", () => openPetChat())
+              .show();
+        },
+      });
+      observer.start();
       if (store.state.settings.petVisible) createPet();
       if (!isTest) createTray();
       registerHandlers();
@@ -108,6 +145,7 @@ else {
       app.on("before-quit", () => {
         app.boboQuitting = true;
         clearInterval(timer);
+        observer?.stop();
         agents.stopAll();
         store.tick();
       });
@@ -297,6 +335,7 @@ function snapshot() {
     },
     desktop: true,
     workspace: store.state.settings.workspace || cfg.workspace,
+    conversationContext: conversationContext(store.state),
   };
 }
 function assertSender(event) {
@@ -325,8 +364,18 @@ function handle(name, fn) {
 }
 function registerHandlers() {
   handle("state", snapshot);
+  handle("observer-configure", (data) =>
+    observer.configure(data.agent, data.enabled),
+  );
+  handle("observer-refresh", () => {
+    observer.drain();
+    return observer.refresh();
+  });
   handle("care", (action) => store.care(action));
-  handle("chat", (message) => brain.chat(message));
+  handle("chat", (data) => {
+    assertRequestContext(store.state, data?.context);
+    return brain.chat(data.message, data.context);
+  });
   handle("refresh-quotas", (agent) => agents.refreshQuotas(agent, true));
   handle("new-conversation", () => {
     if (brain.busy) throw new Error("等这次回复完成后再新建对话。");
@@ -336,11 +385,13 @@ function registerHandlers() {
     if (brain.busy) throw new Error("等这次回复完成后再切换对话。");
     store.selectConversation(id);
   });
-  handle("dispatch", (data) =>
-    agents.dispatch(data.agent, data.title, data.prompt, {
+  handle("dispatch", (data) => {
+    assertRequestContext(store.state, data?.context);
+    store.alignConversation();
+    return agents.dispatch(data.agent, data.title, data.prompt, {
       contract: data.contract,
-    }),
-  );
+    });
+  });
   handle("cancel", (id) => agents.cancel(id));
   handle("workflow", (id) => agents.report(id));
   handle("project-memory", () =>
@@ -377,11 +428,32 @@ function registerHandlers() {
       id,
     ),
   );
+  handle("replace-project-memory", (data) => {
+    const current = store.state.settings.workspace || loadConfig().workspace;
+    if (
+      !current ||
+      typeof data?.workspace !== "string" ||
+      current !== data.workspace ||
+      fs.realpathSync(current) !== fs.realpathSync(data.workspace)
+    )
+      throw new Error("项目已改变，请回到原项目重新编辑记忆。");
+    return replaceProjectMemory(store, current, data.id, {
+      text: data.text,
+      kind: data.kind,
+      expectedRevision: data.expectedRevision,
+      source: { kind: "user_ui" },
+    });
+  });
   handle("contract", (data) => agents.setContract(data.id, data.contract));
-  handle("resume", (data) => agents.resume(data.id, data.agent, data.note));
+  handle("resume", (data) =>
+    agents.resume(data.id, data.agent, data.note, { source: "user_ui" }),
+  );
   handle("verify", (id) => agents.verify(id));
+  handle("run-tests", (id) => agents.verify(id, { execute: true }));
   handle("supervision", (data) =>
-    agents.supervisor.configure(data.id, data.enabled, data.allowedAgents),
+    agents.supervisor.configure(data.id, data.enabled, data.allowedAgents, {
+      source: "user_ui",
+    }),
   );
   handle("correction", (data) =>
     agents.recordCorrection(data.id, data.text, data.correctionId),
@@ -397,7 +469,13 @@ function registerHandlers() {
       )
         throw new Error("接手名单无效。");
       store.state.settings.fallbackAgents = [...new Set(data.fallbackAgents)];
+      store.state.settings.fallbackPolicy = policy("user_ui");
     }
+    if (
+      data?.dismissFallbackMigration === true &&
+      store.state.settings.fallbackMigration
+    )
+      store.state.settings.fallbackMigration.dismissed = true;
     for (const key of ["allowEdits", "quiet", "alwaysOnTop", "superviseTasks"])
       if (typeof data?.[key] === "boolean")
         store.state.settings[key] = data[key];
@@ -421,6 +499,7 @@ function registerHandlers() {
     if (!result.canceled && result.filePaths[0]) {
       store.state.settings.workspace = result.filePaths[0];
       store.state.settings.allowEdits = false;
+      store.alignConversation();
       store.save();
     }
     return store.state.settings.workspace;
@@ -433,6 +512,12 @@ function registerHandlers() {
     if (!result.canceled && result.filePaths[0]) {
       process.env.BOBO_ENV_PATH = result.filePaths[0];
       store.state.settings.envPath = result.filePaths[0];
+      store.state.settings.allowEdits = false;
+      try {
+        store.alignConversation();
+      } catch {
+        /* Keep invalid scope read-only. */
+      }
       store.save();
     }
     return publicConfig();

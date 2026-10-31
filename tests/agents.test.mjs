@@ -23,6 +23,7 @@ function fixture(t) {
   });
   const store = new Store(path.join(dir, "data"));
   store.state.settings.workspace = dir;
+  store.newConversation();
   let child,
     options,
     args,
@@ -63,19 +64,35 @@ function fixture(t) {
     },
   };
 }
-test("fresh exhausted shared quota blocks dispatch; model-specific and manual quotas do not", t => {
-  const f = fixture(t), future = new Date(Date.now() + 60000).toISOString();
-  f.store.state.quotas.codex = {source:"codex-app-server", status:"fresh", updatedAt:Date.now(), windows:[{limitId:"codex",label:"codex",remainingPercent:0,resetAt:future}]};
-  assert.throws(() => f.manager.dispatch("codex","额度检查","做一件事"), /额度窗口已耗尽/);
+test("fresh exhausted shared quota blocks dispatch; model-specific and manual quotas do not", (t) => {
+  const f = fixture(t),
+    future = new Date(Date.now() + 60000).toISOString();
+  f.store.state.quotas.codex = {
+    source: "codex-app-server",
+    status: "fresh",
+    updatedAt: Date.now(),
+    windows: [
+      {
+        limitId: "codex",
+        label: "codex",
+        remainingPercent: 0,
+        resetAt: future,
+      },
+    ],
+  };
+  assert.throws(
+    () => f.manager.dispatch("codex", "额度检查", "做一件事"),
+    /额度窗口已耗尽/,
+  );
   assert.equal(f.child, undefined);
   f.store.state.quotas.codex.windows[0].limitId = "unrelated-model";
-  const task = f.manager.dispatch("codex","模型额度","做一件事");
+  const task = f.manager.dispatch("codex", "模型额度", "做一件事");
   assert.ok(task.id);
   f.child.emit("close", 1);
   f.store.state.quotas.codex.source = "manual";
   f.store.state.quotas.codex.status = "manual";
   f.store.state.quotas.codex.windows[0].limitId = "codex";
-  assert.ok(f.manager.dispatch("codex","手动信息","做一件事").id);
+  assert.ok(f.manager.dispatch("codex", "手动信息", "做一件事").id);
   f.child.emit("close", 1);
 });
 test("dispatch uses argv and stdin, strips scheduler credentials, and waits for a real result", (t) => {
@@ -110,7 +127,12 @@ test("dispatch uses argv and stdin, strips scheduler credentials, and waits for 
   const task = f.store.state.tasks.find((t) => t.id === id);
   assert.equal(task.status, "completed");
   assert.equal(task.result, "done");
-  assert.deepEqual(task.usage, { input: 20, output: 10 });
+  assert.deepEqual(task.usage, {
+    input: 20,
+    output: 10,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
   assert.equal(f.manager.running.size, 0);
 });
 test("exit code zero with no result is a failure; API error text is redacted", (t) => {

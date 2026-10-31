@@ -1,4 +1,10 @@
 import { quotaQueryAgent, formatQuotaReply } from "./quota.mjs";
+import fs from "node:fs";
+import {
+  assertConversationScope,
+  assertRequestContext,
+  taskInCurrentScope,
+} from "./conversation-scope.mjs";
 import { createModelClient, modelRequestOptions } from "./model-client.mjs";
 import { BOBO_SYSTEM_PROMPT, PERSONA_VERSION } from "./persona.mjs";
 import { loadConfig, publicConfig, redact } from "./config.mjs";
@@ -7,7 +13,8 @@ import { readTaskReport } from "./task-memory.mjs";
 import { verificationFreshness, rootOf } from "./workflow.mjs";
 import { packChatHistory, estimateTokens } from "./context-budget.mjs";
 import {
-  listProjectMemories,
+  searchProjectMemory,
+  readProjectMemory,
   saveProjectMemory,
   revokeProjectMemory,
   retrieveProjectMemory,
@@ -32,10 +39,20 @@ const definition = (
 export const TOOLS = [
   definition(
     "search_project_memory",
-    "按当前项目检索用户确认的长期记忆。revoked 是已撤销；不会检索其他项目。",
+    "按当前项目检索用户确认的长期记忆预览；预览不是完整规则，使用 read_project_memory 读取正文。revoked 是已撤销；翻页沿用同一 query。",
     {
       query: { type: "string" },
+      cursor: {
+        type: "integer",
+        minimum: 0,
+        description: "首屏为 0，后续使用 nextCursor。",
+      },
     },
+  ),
+  definition(
+    "read_project_memory",
+    "按当前项目的记忆 ID 读取完整正文、状态及替换关系，不返回历史审计内容。",
+    { memory_id: { type: "string" } },
   ),
   definition(
     "save_project_memory",
@@ -141,6 +158,11 @@ export const TOOLS = [
       },
     },
   ),
+  definition(
+    "get_observed_sessions",
+    "查看已开启观察的外部 Codex / CC 会话元数据；observed 或过时状态不是实时进度，不会接管或恢复外部任务。",
+    {},
+  ),
   definition("care_for_bobo", "用户要求浇水、摸摸、晒太阳或睡觉时执行照料。", {
     action: { type: "string", enum: ["water", "touch", "sun", "sleep"] },
   }),
@@ -148,21 +170,46 @@ export const TOOLS = [
 export function executeTool(store, agents, name, args) {
   if (!args || typeof args !== "object" || Array.isArray(args))
     throw new Error("工具参数格式不正确。");
+  if (
+    [
+      "stop_task",
+      "configure_task_supervision",
+      "record_task_correction",
+      "get_task_workflow",
+      "resume_task",
+      "verify_task",
+      "read_task_result",
+    ].includes(name)
+  ) {
+    const task = store.state.tasks.find((t) => t.id === args.task_id);
+    if (!task || !taskInCurrentScope(store.state, task))
+      throw new Error("这项任务不属于当前项目，请先切回原项目。");
+  }
   switch (name) {
+    case "get_observed_sessions":
+      return {
+        claudeEnabled: Boolean(store.state.observer?.claudeEnabled),
+        codexEnabled: Boolean(store.state.observer?.codexEnabled),
+        sessions: (store.state.observer?.sessions || [])
+          .filter((session) => taskInCurrentScope(store.state, session))
+          .slice(0, 30),
+        now: Date.now(),
+        note: "CC 超过 5 分钟无事件时状态待刷新；Codex observed 仅证明存在会话记录，不代表仍在运行。",
+      };
     case "search_project_memory": {
-      if (typeof args.query !== "string" || args.query.length > 2000)
-        throw new Error("记忆检索最多 2000 字符。");
-      const memories = listProjectMemories(
+      return searchProjectMemory(
         store,
         store.state.settings.workspace || loadConfig().workspace,
         args.query,
+        args.cursor ?? 0,
       );
-      return {
-        entries: memories.slice(0, 8),
-        omitted: Math.max(0, memories.length - 8),
-        source: "user_confirmed_project_memory",
-      };
     }
+    case "read_project_memory":
+      return readProjectMemory(
+        store,
+        store.state.settings.workspace || loadConfig().workspace,
+        args.memory_id,
+      );
     case "save_project_memory": {
       const source = store.state.messages.findLast((m) => m.role === "user");
       if (
@@ -217,6 +264,7 @@ export function executeTool(store, agents, name, args) {
         args.task_id,
         args.enabled,
         args.allowed_agents,
+        { source: "model" },
       );
     case "record_task_correction": {
       const source = store.state.messages.findLast((m) => m.role === "user");
@@ -243,7 +291,9 @@ export function executeTool(store, agents, name, args) {
       };
     }
     case "resume_task":
-      return agents.resume(args.task_id, args.agent, args.note);
+      return agents.resume(args.task_id, args.agent, args.note, {
+        source: "model",
+      });
     case "verify_task":
       return agents.verify(args.task_id);
     case "get_agent_quotas":
@@ -255,6 +305,7 @@ export function executeTool(store, agents, name, args) {
       return agents.list();
     case "get_tasks":
       return store.state.tasks
+        .filter((t) => taskInCurrentScope(store.state, t))
         .filter((t) => !t.childId)
         .slice(0, 15)
         .map(({ id, rootId, agent, title, status, progress, error }) => ({
@@ -318,10 +369,14 @@ export class Brain {
     this.clientFactory = clientFactory;
     this.busy = false;
   }
-  async chat(message) {
+  async chat(message, requestContext) {
     if (typeof message !== "string" || !message.trim() || message.length > 8000)
       throw new Error("告诉我一段 1～8000 字的需求吧。");
     if (this.busy) throw new Error("我正在整理上一句话，稍等一下就好。");
+    if (requestContext !== undefined)
+      assertRequestContext(this.store.state, requestContext);
+    assertConversationScope(this.store.state);
+    const conversationId = this.store.state.activeConversationId;
     this.busy = true;
     this.accounting = {
       rootIds: new Set(),
@@ -332,7 +387,7 @@ export class Brain {
     };
     this.store.onChange();
     const cfg = loadConfig();
-    this.store.message("user", message.trim());
+    this.store.message("user", message.trim(), conversationId);
     try {
       const quotaAgent = quotaQueryAgent(message);
       if (quotaAgent && this.agents.refreshQuotas) {
@@ -341,14 +396,14 @@ export class Brain {
           true,
         );
         const reply = formatQuotaReply(refreshed);
-        this.store.message("assistant", reply);
+        this.store.message("assistant", reply, conversationId);
         return reply;
       }
       if (!cfg.key || cfg.configurationIssue) {
         const reply =
           cfg.configurationIssue ||
           "我在这里陪你。自然语言聊天和调度还需要配置 .env 里的 OPENAI_API_KEY 或 MODEL_HUB_AK；现在可以浇水、摸摸我，也可以用「交给 Agent」直接创建任务。";
-        this.store.message("assistant", reply);
+        this.store.message("assistant", reply, conversationId);
         return reply;
       }
       const client = this.clientFactory(cfg),
@@ -361,12 +416,29 @@ export class Brain {
           sleeping: state.pet.sleeping,
         },
         diary: state.diary
+          .filter((m) => m.kind !== "work")
           .slice(0, 5)
           .map(({ title, text }) => ({ title, text })),
         agents: this.agents.list(),
         workspace: state.settings.workspace || cfg.workspace || "未选择",
         allowEdits: state.settings.allowEdits,
       };
+      // Bind this model turn to a physical project and permission snapshot.
+      // A symlink retarget or inaccessible directory must invalidate late tools.
+      const scopeOf = () => {
+        const workspace = state.settings.workspace || loadConfig().workspace;
+        if (!workspace) return "";
+        try {
+          const canonical = fs.realpathSync(workspace);
+          if (!fs.statSync(canonical).isDirectory()) return null;
+          fs.accessSync(canonical, fs.constants.R_OK);
+          return canonical;
+        } catch {
+          return null;
+        }
+      };
+      const requestScope = scopeOf(),
+        requestAllowEdits = Boolean(context.allowEdits);
       const memories = retrieveProjectMemory(
         this.store,
         context.workspace,
@@ -446,10 +518,20 @@ export class Brain {
         if (!calls.length) {
           const reply =
             redact(text.trim()) || "我没有收到完整回复。请再告诉我一次。";
-          this.store.message("assistant", reply);
+          this.store.message("assistant", reply, conversationId);
           return reply;
         }
         for (const call of calls) {
+          if (
+            requestScope === null ||
+            state.activeConversationId !== conversationId ||
+            scopeOf() !== requestScope ||
+            Boolean(state.settings.allowEdits) !== requestAllowEdits
+          ) {
+            const reply = "项目或权限已改变，请在当前项目重新发起。";
+            this.store.message("assistant", reply, conversationId);
+            return reply;
+          }
           let output;
           if (seen.has(call.call_id)) output = seen.get(call.call_id);
           else {
@@ -485,6 +567,11 @@ export class Brain {
               if (related)
                 this.accounting.rootIds.add(related.rootId || related.id);
             } catch (error) {
+              if (error.code === "CROSS_AGENT_CONSENT_REQUIRED") {
+                const reply = error.message;
+                this.store.message("assistant", reply, conversationId);
+                return reply;
+              }
               output = JSON.stringify({ error: redact(error.message) });
             }
             seen.set(call.call_id, output);
@@ -505,7 +592,7 @@ export class Brain {
       }
       const reply =
         "我已达到这轮操作上限。已经创建的任务会继续显示在任务面板里。";
-      this.store.message("assistant", reply);
+      this.store.message("assistant", reply, conversationId);
       return reply;
     } catch (error) {
       const code = error.status;
@@ -518,7 +605,7 @@ export class Brain {
             : code === 404
               ? "没有找到配置的模型或 API 地址，请检查 .env 中当前提供方的 MODEL、BASE_URL 和 API_VERSION。"
               : `这次没有连上调度模型：${redact(error.message)}。可以在设置中检查配置。`;
-      this.store.message("assistant", reply);
+      this.store.message("assistant", reply, conversationId);
       return reply;
     } finally {
       if (this.accounting.requests) {

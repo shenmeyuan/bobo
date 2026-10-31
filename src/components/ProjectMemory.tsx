@@ -9,11 +9,13 @@ export function ProjectMemory({ workspace }: { workspace: string }) {
   const [query, setQuery] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState<ProjectMemoryEntry | null>(null);
   useEffect(() => {
     setEntries([]);
     setError("");
     setText("");
     setQuery("");
+    setEditing(null);
     let alive = true;
     const refresh = () =>
       api
@@ -82,18 +84,48 @@ export function ProjectMemory({ workspace }: { workspace: string }) {
                   : "由你保存"}{" "}
                 · {new Date(m.updatedAt).toLocaleString()}
               </p>
+              {m.supersededBy && (
+                <p className="workflow-muted">已由新记忆替换</p>
+              )}
+              {m.supersedes && (
+                <p className="workflow-muted">替换了旧记忆，旧内容已保留</p>
+              )}
               {m.status === "active" && (
-                <button
-                  className="outline small"
-                  disabled={busy}
-                  onClick={() => void act(() => api.revokeProjectMemory(m.id))}
-                >
-                  撤下记忆
-                </button>
+                <>
+                  <button
+                    className="outline small"
+                    disabled={busy}
+                    onClick={() => {
+                      setEditing(m);
+                      setText(m.text);
+                      setKind(m.kind);
+                      setError("");
+                    }}
+                  >
+                    替换记忆
+                  </button>
+                  <button
+                    className="outline small"
+                    disabled={busy}
+                    onClick={() =>
+                      void act(() => api.revokeProjectMemory(m.id))
+                    }
+                  >
+                    撤下记忆
+                  </button>
+                </>
               )}
             </div>
           </article>
         ))}
+      {editing && (
+        <div className="workflow-muted">
+          <p>
+            正在替换版本 {editing.revision}：{editing.text}
+          </p>
+          <p>保存后旧记忆将撤下，新内容作为有效记忆；旧内容仍可查看。</p>
+        </div>
+      )}
       <textarea
         aria-label="新的项目记忆"
         maxLength={2000}
@@ -115,13 +147,36 @@ export function ProjectMemory({ workspace }: { workspace: string }) {
         disabled={busy || !workspace || !text.trim()}
         onClick={() =>
           void act(async () => {
-            await api.saveProjectMemory(text, kind);
+            if (editing) {
+              await api.replaceProjectMemory(
+                editing.id,
+                text,
+                kind,
+                editing.revision,
+                workspace,
+              );
+              setEditing(null);
+            } else await api.saveProjectMemory(text, kind);
             setText("");
           })
         }
       >
-        保存项目记忆
+        {editing ? "保存替换" : "保存项目记忆"}
       </button>
+      {editing && (
+        <button
+          className="outline small"
+          disabled={busy}
+          onClick={() => {
+            setEditing(null);
+            setText("");
+            setKind("feedback");
+            setError("");
+          }}
+        >
+          取消替换
+        </button>
+      )}
       {error && (
         <p role="alert" className="workflow-muted">
           {error}

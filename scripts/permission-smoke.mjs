@@ -19,6 +19,7 @@ process.env.BOBO_ENV_PATH = path.join(directory, ".env");
 fs.writeFileSync(process.env.BOBO_ENV_PATH, `BOBO_TRAE_PATH=${childScript}\n`);
 const store = new Store(path.join(directory, "data"));
 store.state.settings.workspace = directory;
+store.newConversation();
 store.state.settings.allowEdits = true;
 store.state.settings.superviseTasks = true;
 let notifications = 0;

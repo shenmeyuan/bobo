@@ -1,9 +1,14 @@
 import fs from "node:fs";
+import { usageLedger } from "./usage-ledger.mjs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { loadConfig, redact } from "./config.mjs";
 import { readTaskReport, selectReportExcerpts } from "./task-memory.mjs";
-import { syncWorkMemory, retrieveProjectMemory } from "./work-memory.mjs";
+import {
+  syncWorkMemory,
+  retrieveProjectMemory,
+  isMandatoryProjectMemory,
+} from "./work-memory.mjs";
 import { fitContext } from "./context-budget.mjs";
 
 const hash = (data) => createHash("sha256").update(data).digest("hex");
@@ -105,7 +110,7 @@ export function validateContract(value) {
   const checks = value.checks.map((c) => {
     if (
       !c ||
-      !["exists", "contains", "json"].includes(c.kind) ||
+      !["exists", "contains", "json", "node_test"].includes(c.kind) ||
       typeof c.path !== "string" ||
       !c.path.trim() ||
       c.path.length > 500 ||
@@ -114,6 +119,8 @@ export function validateContract(value) {
       (c.kind === "contains" && !c.expected.trim())
     )
       throw new Error("请填写文件路径和有效的检查条件。");
+    if (c.kind === "node_test" && !/\.test\.(?:mjs|cjs|js)$/.test(c.path))
+      throw new Error("请选择 .test.js / .test.mjs / .test.cjs 测试文件。");
     // File may not exist yet; full containment is checked when read.
     if (
       path.isAbsolute(c.path) ||
@@ -167,8 +174,27 @@ export function validateContract(value) {
     throw new Error(
       "尝试次数需为 1～10；Token 阈值需为正整数或留空；交接上下文预算需为 512～32000。",
     );
+  const maxDurationMinutes =
+    value.maxDurationMinutes == null || value.maxDurationMinutes === ""
+      ? null
+      : Number(value.maxDurationMinutes);
+  const quietAfterMinutes = Number(value.quietAfterMinutes ?? 3);
+  if (
+    (maxDurationMinutes !== null &&
+      (!Number.isInteger(maxDurationMinutes) ||
+        maxDurationMinutes < 1 ||
+        maxDurationMinutes > 1440)) ||
+    !Number.isInteger(quietAfterMinutes) ||
+    quietAfterMinutes < 1 ||
+    quietAfterMinutes > 120
+  )
+    throw new Error(
+      "任务期限需为 1～1440 分钟或留空；安静提示需为 1～120 分钟。",
+    );
   return {
     checks,
+    maxDurationMinutes,
+    quietAfterMinutes,
     maxAttempts,
     tokenLimit,
     contextTokenBudget,
@@ -235,6 +261,7 @@ export function workflowReport(store, task) {
       usage: t.usage,
     })),
     usage: {
+      ledger: usageLedger(attempts, calls),
       input,
       output,
       brainInput,
@@ -289,9 +316,13 @@ export function runVerification(task, contract) {
       return {
         ...check,
         dependencies,
-        passed: true,
+        passed: check.kind !== "node_test",
+        ...(check.kind === "node_test" ? { pendingExecutable: true } : {}),
         sha256,
-        detail: "检查通过",
+        detail:
+          check.kind === "node_test"
+            ? "等待你点击运行测试；保存条件和自动验收不会执行代码。"
+            : "检查通过",
       };
     } catch (error) {
       return {
@@ -307,9 +338,11 @@ export function runVerification(task, contract) {
     at: Date.now(),
     contractSignature: hash(JSON.stringify(contract.checks)),
     status: checks.length
-      ? checks.every((c) => c.passed)
-        ? "passed"
-        : "failed"
+      ? checks.some((c) => !c.passed && !c.pendingExecutable)
+        ? "failed"
+        : checks.some((c) => c.pendingExecutable)
+          ? "needs_recheck"
+          : "passed"
       : "not_configured",
     scope: "仅代表所列文件检查，不能替代完整任务验收",
     checks,
@@ -427,7 +460,8 @@ export function handoffPacket(store, task, note, current, options = {}) {
     : Math.max(0, Math.min(3000, targetChars - anchorChars - 3500));
   const lineage = store.state.tasks
     .filter((t) => (t.rootId || t.id) === root.id)
-    .filter((t) => t.result || t.reportMemory);
+    .filter((t) => t.result || t.reportMemory)
+    .sort((a, b) => b.createdAt - a.createdAt);
   let available = reportBudget;
   const reports = lineage.map((attempt, index) => {
     let source;
@@ -518,9 +552,7 @@ export function handoffPacket(store, task, note, current, options = {}) {
     packet.context_budget.totalChars > targetChars;
   packet.context_budget.transmittedChars = continuationPrompt(packet).length;
   const core = structuredClone(packet);
-  core.project_memory = packet.project_memory.filter(
-    (m) => m.kind !== "reference",
-  );
+  core.project_memory = packet.project_memory.filter(isMandatoryProjectMemory);
   core.reports = packet.reports.map((r) => ({
     ...r,
     excerpts: [],
@@ -528,17 +560,8 @@ export function handoffPacket(store, task, note, current, options = {}) {
     omittedChars: r.totalChars || 0,
   }));
   const optional = [];
-  for (const memory of packet.project_memory.filter(
-    (m) => m.kind === "reference",
-  ))
-    optional.push({
-      apply: (p) => {
-        p.project_memory.push(memory);
-        return p;
-      },
-    });
   // Latest attempt first, with exact source spans. All archives remain reachable.
-  for (let i = packet.reports.length - 1; i >= 0; i--)
+  const addReport = (i) => {
     for (const excerpt of packet.reports[i].excerpts || [])
       optional.push({
         apply: (p) => {
@@ -548,6 +571,18 @@ export function handoffPacket(store, task, note, current, options = {}) {
           return p;
         },
       });
+  };
+  if (packet.reports.length) addReport(0);
+  for (const memory of packet.project_memory.filter(
+    (m) => !isMandatoryProjectMemory(m),
+  ))
+    optional.push({
+      apply: (p) => {
+        p.project_memory.push(memory);
+        return p;
+      },
+    });
+  for (let i = 1; i < packet.reports.length; i++) addReport(i);
   const fitted = fitContext(
     core,
     optional,

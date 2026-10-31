@@ -81,15 +81,24 @@ try {
   await expect(memory).toContainText("1 条有效");
   await page.evaluate(() => window.bobo.newConversation());
   const first = await page.evaluate(() =>
-    window.bobo.dispatch(
-      "codex",
-      "输入依赖测试",
-      "交付 delivery.txt，内容必须为 done。",
-      {
-        checks: [{ kind: "contains", path: "delivery.txt", expected: "done" }],
-        maxAttempts: 3,
-        tokenLimit: null,
-      },
+    window.bobo.getState().then((requestState) =>
+      window.bobo.dispatch(
+        "codex",
+        "输入依赖测试",
+        "交付 delivery.txt，内容必须为 done。",
+        {
+          checks: [
+            { kind: "contains", path: "delivery.txt", expected: "done" },
+          ],
+          maxAttempts: 3,
+          tokenLimit: null,
+        },
+        {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        },
+      ),
     ),
   );
   const status = (id) =>
@@ -153,6 +162,20 @@ try {
   const screenshot = path.join(root, "work", "work-memory-smoke.png");
   fs.mkdirSync(path.dirname(screenshot), { recursive: true });
   await page.screenshot({ path: screenshot });
+  await memory.getByRole("button", { name: "替换记忆" }).click();
+  await expect(memory).toContainText(`正在替换版本 1：${rule}`);
+  const replacementRule = "金额采用整数分；展示时保留中文字段。";
+  await memory.getByLabel("新的项目记忆").fill(replacementRule);
+  await memory.getByRole("button", { name: "保存替换" }).click();
+  await expect(memory).toContainText("1 条有效");
+  await expect(memory).toContainText("已由新记忆替换");
+  await expect(memory).toContainText(replacementRule);
+  await expect(memory).toContainText(rule);
+  const replaced = await page.evaluate(() => window.bobo.getProjectMemory());
+  expect(replaced.find((m) => m.text === rule).status).toBe("revoked");
+  expect(replaced.find((m) => m.text === replacementRule).supersedes).toBe(
+    replaced.find((m) => m.text === rule).id,
+  );
   await memory.getByRole("button", { name: "撤下记忆" }).click();
   await expect(memory).toContainText("已撤下");
   await home.screenshot({
@@ -162,11 +185,21 @@ try {
   app = null;
   page = await launch();
   const persisted = await page.evaluate(() => window.bobo.getProjectMemory());
-  expect(persisted[0].status).toBe("revoked");
-  expect(persisted[0].revision).toBe(2);
+  expect(persisted).toHaveLength(2);
+  expect(
+    persisted.every((m) => m.status === "revoked" && m.revision === 2),
+  ).toBe(true);
   await page.evaluate(() => window.bobo.newConversation());
   const next = await page.evaluate(() =>
-    window.bobo.dispatch("codex", "新会话", "检查新任务"),
+    window.bobo
+      .getState()
+      .then((requestState) =>
+        window.bobo.dispatch("codex", "新会话", "检查新任务", undefined, {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        }),
+      ),
   );
   await expect.poll(() => status(next.id)).toBe("completed");
   expect(invocations().at(-1).prompt).toContain('"status":"revoked"');

@@ -20,6 +20,8 @@ import {
 } from "lucide-react";
 import { Bobo } from "./Bobo";
 import { api, agentNames, stageNames, taskStatuses } from "../lib/api";
+import { ObservedSessions } from "./ObservedSessions";
+import { FallbackSummary } from "./FallbackSummary";
 import { TaskWorkflow } from "./TaskWorkflow";
 import { stageOf } from "../../electron/pet.mjs";
 import type { AgentId, CareAction, Stage, State } from "../lib/types";
@@ -74,13 +76,25 @@ export function DesktopPet({
     return () => clearTimeout(timer);
   }, [state.messages.at(-1)?.id]);
   const drafts = useRef<Record<string, string>>({});
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const draftConversation = useRef(state.activeConversationId || "legacy");
+  useEffect(() => {
+    const next = state.activeConversationId || "legacy";
+    if (next !== draftConversation.current) {
+      drafts.current[draftConversation.current] = draftRef.current;
+      draftConversation.current = next;
+      setDraft(drafts.current[next] || "");
+      setTaskId(null);
+      setError("");
+    }
+  }, [state.activeConversationId]);
+  const readOnly = state.conversationContext?.canSend === false;
   const changeConversation = async (id?: string) => {
     if (busy) return;
     await action(async () => {
-      drafts.current[state.activeConversationId || "legacy"] = draft;
       if (id) await api.selectConversation(id);
       else id = await api.newConversation();
-      setDraft(drafts.current[id!] || "");
       setView("chat");
       setMenuOpen(false);
       setTaskId(null);
@@ -169,28 +183,41 @@ export function DesktopPet({
     }
   };
   const send = async () => {
+    if (draftConversation.current !== (state.activeConversationId || "legacy"))
+      return;
     const text = draft.trim();
-    if (!text || busy) return;
+    if (!text || busy || readOnly) return;
     setView("chat");
     setMenuOpen(false);
     setSending(true);
     setError("");
     setDraft("");
+    const conversationId = state.activeConversationId || "legacy";
+    const context = {
+      conversationId: state.activeConversationId,
+      scope: state.conversationContext?.scope,
+      allowEdits: state.settings.allowEdits,
+    };
     try {
-      if (mode === "chat") await api.chat(text);
+      if (mode === "chat") await api.chat(text, context);
       else {
-        const created = await api.dispatch(mode, "", text);
-        setTaskId(created.id);
-        setView("tasks");
+        const created = await api.dispatch(mode, "", text, undefined, context);
+        if (draftConversation.current === conversationId) {
+          setTaskId(created.id);
+          setView("tasks");
+        }
       }
     } catch (e) {
-      setDraft(text);
-      setError(
-        (e as Error).message.replace(
-          /^Error invoking remote method '[^']+': Error: /,
-          "",
-        ),
-      );
+      drafts.current[conversationId] = text;
+      if (draftConversation.current === conversationId) {
+        setDraft(text);
+        setError(
+          (e as Error).message.replace(
+            /^Error invoking remote method '[^']+': Error: /,
+            "",
+          ),
+        );
+      }
     } finally {
       setSending(false);
     }
@@ -203,7 +230,12 @@ export function DesktopPet({
   };
   const stage = preview ? "adult" : (stageOf(state.pet).id as Stage);
   const hasThread =
-    state.messages.length > 0 || busy || Boolean(error) || view !== "chat";
+    state.messages.length > 0 ||
+    busy ||
+    Boolean(error) ||
+    readOnly ||
+    mode !== "chat" ||
+    view !== "chat";
   return (
     <div
       className="pet-surface"
@@ -285,6 +317,26 @@ export function DesktopPet({
                     <X size={15} />
                   </button>
                 </header>
+                {readOnly && (
+                  <div className="bubble-error pet-hit" role="status">
+                    <p>
+                      {state.conversationContext?.reason ||
+                        "仅查看；请在当前项目新建对话。"}
+                    </p>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void changeConversation()}
+                    >
+                      在当前项目新建对话
+                    </button>
+                  </div>
+                )}
+                {mode !== "chat" && (
+                  <div className="pet-hit">
+                    <FallbackSummary state={state} />
+                  </div>
+                )}
                 {view === "quotas" ? (
                   <div className="bubble-tasks bubble-quotas">
                     <button
@@ -384,7 +436,12 @@ export function DesktopPet({
                               : c.messages.at(-1)?.content) || "还没有消息"}
                           </span>
                           <small>
-                            {c.messages.length} 条消息 ·{" "}
+                            {c.scope?.kind === "workspace"
+                              ? c.scope.path
+                              : c.scope?.kind === "general"
+                                ? "通用对话"
+                                : "未绑定历史，仅供查看"}{" "}
+                            · {c.messages.length} 条消息 ·{" "}
                             {
                               state.tasks.filter(
                                 (t) => t.conversationId === c.id,
@@ -437,6 +494,7 @@ export function DesktopPet({
                       <ArrowLeft size={14} />
                       {task ? "所有任务" : "回到对话"}
                     </button>
+                    {!task && <ObservedSessions state={state} />}
                     {task ? (
                       <article className="bubble-task-detail">
                         <div className="bubble-task-meta">
@@ -570,6 +628,7 @@ export function DesktopPet({
                   : `交给 ${agentNames[mode]}…`
               }
               value={draft}
+              disabled={readOnly}
               maxLength={8000}
               onChange={(e) => setDraft(e.target.value)}
               rows={1}
@@ -588,7 +647,7 @@ export function DesktopPet({
               className="composer-send"
               type="submit"
               aria-label="发送消息"
-              disabled={busy || !draft.trim()}
+              disabled={busy || readOnly || !draft.trim()}
             >
               {busy ? (
                 <LoaderCircle size={19} className="spin" />

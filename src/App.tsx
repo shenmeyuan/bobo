@@ -33,8 +33,10 @@ import {
 } from "lucide-react";
 import { DesktopPet } from "./components/DesktopPet";
 import { Bobo } from "./components/Bobo";
+import { ObservedSessions } from "./components/ObservedSessions";
 import { TaskWorkflow } from "./components/TaskWorkflow";
 import { ProjectMemory } from "./components/ProjectMemory";
+import { FallbackSummary } from "./components/FallbackSummary";
 import {
   api,
   agentNames,
@@ -515,6 +517,7 @@ export default function App() {
                   dispatch={setDispatchAgent}
                   quota={setQuotaAgent}
                 />
+                <ObservedSessions state={state} />
                 <TasksSection
                   state={state}
                   openTask={setTask}
@@ -982,6 +985,7 @@ function Settings({
 }) {
   return (
     <div className="settings-content">
+      <ObservedSessions state={state} settings />
       {state.desktop && <ProjectMemory workspace={state.workspace} />}
       <section className="settings-card">
         <div className="settings-title">
@@ -1107,7 +1111,24 @@ function Settings({
             }
           />
         </div>
-        <p>限额时允许哪些工具接手新任务</p>
+        {state.settings.fallbackMigration &&
+          !state.settings.fallbackMigration.dismissed && (
+            <div role="status" className="settings-footnote">
+              <p>旧接手名单缺少明确授权记录，现仅原工具；可在设置重新选择。</p>
+              <button
+                className="outline small"
+                onClick={() =>
+                  perform(() =>
+                    api.setSettings({ dismissFallbackMigration: true }),
+                  )
+                }
+              >
+                知道了
+              </button>
+            </div>
+          )}
+        <p>限额时允许哪些工具接手新任务（默认不选）</p>
+        <FallbackSummary state={state} />
         <div className="workflow-agent-options">
           {state.agents
             .filter((a) => a.capability === "cli")
@@ -1261,8 +1282,21 @@ function DispatchModal({
   const [prompt, setPrompt] = useState(""),
     [title, setTitle] = useState(""),
     [artifactPath, setArtifactPath] = useState(""),
+    [deadline, setDeadline] = useState(""),
+    [tokenLimit, setTokenLimit] = useState(""),
     [busy, setBusy] = useState(false);
+  const [requestContext] = useState(() => ({
+    conversationId: state.activeConversationId,
+    scope: state.conversationContext?.scope,
+    allowEdits: state.settings.allowEdits,
+  }));
+  const contextChanged =
+    requestContext.conversationId !== state.activeConversationId ||
+    requestContext.allowEdits !== state.settings.allowEdits ||
+    JSON.stringify(requestContext.scope) !==
+      JSON.stringify(state.conversationContext?.scope);
   const submit = () => {
+    if (contextChanged) return;
     setBusy(true);
     perform(
       async () => {
@@ -1270,15 +1304,15 @@ function DispatchModal({
           agent,
           title,
           prompt,
-          artifactPath.trim()
-            ? {
-                checks: [
-                  { kind: "exists", path: artifactPath.trim(), expected: "" },
-                ],
-                maxAttempts: 3,
-                tokenLimit: null,
-              }
-            : undefined,
+          {
+            checks: artifactPath.trim()
+              ? [{ kind: "exists", path: artifactPath.trim(), expected: "" }]
+              : [],
+            maxAttempts: 3,
+            tokenLimit: tokenLimit ? Number(tokenLimit) : null,
+            maxDurationMinutes: deadline ? Number(deadline) : null,
+          },
+          requestContext,
         );
         close();
       },
@@ -1294,6 +1328,10 @@ function DispatchModal({
       description="需求原样转交，你可以在任务面板查看进展。"
       close={close}
     >
+      <FallbackSummary state={state} />
+      {contextChanged && (
+        <p role="alert">项目、对话或权限已改变，请关闭后重新创建任务。</p>
+      )}
       <div className="agent-picker">
         {state.agents.map((a) => (
           <button
@@ -1344,6 +1382,35 @@ function DispatchModal({
           />
         </label>
       )}
+      {agent !== "doubao" && (
+        <details>
+          <summary>运行期限与预算（可选）</summary>
+          <label className="field">
+            本次执行期限（分钟，留空不限时）
+            <input
+              aria-label="新任务执行期限"
+              type="number"
+              min="1"
+              max="1440"
+              value={deadline}
+              onChange={(e) => setDeadline(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            任务 Token 阈值（留空不限制）
+            <input
+              aria-label="新任务 Token 阈值"
+              type="number"
+              min="1"
+              value={tokenLimit}
+              onChange={(e) => setTokenLimit(e.target.value)}
+            />
+          </label>
+          <p className="workflow-muted">
+            达到执行期限时暂停。Token 阈值依赖执行器回报，不是实时计费硬上限。
+          </p>
+        </details>
+      )}
       <div className="dispatch-context">
         <FolderOpen size={15} />
         {agent === "doubao" ? (
@@ -1363,7 +1430,7 @@ function DispatchModal({
         </button>
         <button
           className="primary"
-          disabled={!prompt.trim() || busy}
+          disabled={!prompt.trim() || busy || contextChanged}
           onClick={submit}
         >
           {busy ? (

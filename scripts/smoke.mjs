@@ -189,7 +189,15 @@ try {
     "小萝、圆圆、叶叶",
   );
   const stopped = await pet.evaluate(() =>
-    window.bobo.dispatch("codex", "停止测试", "WAIT"),
+    window.bobo
+      .getState()
+      .then((requestState) =>
+        window.bobo.dispatch("codex", "停止测试", "WAIT", undefined, {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        }),
+      ),
   );
   await pet.evaluate((id) => window.bobo.openPetChat(id), stopped.id);
   await pet.getByRole("button", { name: "停止任务" }).click();

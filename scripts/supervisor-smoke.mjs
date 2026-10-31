@@ -50,15 +50,24 @@ try {
     }),
   );
   const first = await page.evaluate(() =>
-    window.bobo.dispatch(
-      "codex",
-      "自动照看实测",
-      "交付 delivery.json，status 为 done。",
-      {
-        checks: [{ kind: "contains", path: "delivery.json", expected: "done" }],
-        maxAttempts: 3,
-        tokenLimit: null,
-      },
+    window.bobo.getState().then((requestState) =>
+      window.bobo.dispatch(
+        "codex",
+        "自动照看实测",
+        "交付 delivery.json，status 为 done。",
+        {
+          checks: [
+            { kind: "contains", path: "delivery.json", expected: "done" },
+          ],
+          maxAttempts: 3,
+          tokenLimit: null,
+        },
+        {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        },
+      ),
     ),
   );
   await page.evaluate((id) => window.bobo.openPetChat(id), first.id);
@@ -102,7 +111,15 @@ try {
     path: path.join(root, "work", "supervisor-smoke.png"),
   });
   const stopped = await page.evaluate(() =>
-    window.bobo.dispatch("codex", "停止后不要重启", "无操作"),
+    window.bobo
+      .getState()
+      .then((requestState) =>
+        window.bobo.dispatch("codex", "停止后不要重启", "无操作", undefined, {
+          conversationId: requestState.activeConversationId,
+          scope: requestState.conversationContext.scope,
+          allowEdits: requestState.settings.allowEdits,
+        }),
+      ),
   );
   await expect
     .poll(

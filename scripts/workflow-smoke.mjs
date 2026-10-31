@@ -45,11 +45,21 @@ try {
   page.on("pageerror", (e) => errors.push(e.message));
   await expect(page.locator(".pet-name")).toContainText("Bobo");
   const first = await page.evaluate(() =>
-    window.bobo.dispatch(
-      "codex",
-      "交接与验收测试",
-      "完成 delivery.json，status 必须为 done。",
-    ),
+    window.bobo
+      .getState()
+      .then((requestState) =>
+        window.bobo.dispatch(
+          "codex",
+          "交接与验收测试",
+          "完成 delivery.json，status 必须为 done。",
+          undefined,
+          {
+            conversationId: requestState.activeConversationId,
+            scope: requestState.conversationContext.scope,
+            allowEdits: requestState.settings.allowEdits,
+          },
+        ),
+      ),
   );
   await expect
     .poll(

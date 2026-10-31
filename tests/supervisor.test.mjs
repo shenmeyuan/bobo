@@ -20,6 +20,7 @@ function fixture(t) {
   );
   const store = new Store(path.join(dir, "data"));
   store.state.settings.workspace = work;
+  store.newConversation();
   const children = [],
     notices = [];
   let now = Date.now();
@@ -148,6 +149,43 @@ test("quiet output and live old process never trigger a duplicate", (t) => {
   f.children[0].emit("close", 1);
   f.advance();
   assert.equal(f.children.length, 2);
+});
+test("normal long work survives beyond 30 minutes; an explicit deadline pauses without retry", (t) => {
+  const f = fixture(t),
+    first = f.manager.dispatch("codex", "long", "work for hours");
+  f.advance(31 * 60000);
+  assert.equal(f.manager.task(first.id).status, "running");
+  assert.equal(f.children.length, 1);
+  const g = fixture(t),
+    limited = g.manager.dispatch("codex", "bounded", "work", {
+      contract: { checks: [], maxDurationMinutes: 2, quietAfterMinutes: 1 },
+    });
+  g.advance(61000);
+  assert.equal(g.manager.task(limited.id).quiet, true);
+  assert.equal(g.manager.task(limited.id).status, "running");
+  g.advance(60000);
+  assert.equal(g.manager.task(limited.id).status, "attention");
+  assert.match(g.manager.task(limited.id).error, /执行期限/);
+  assert.match(g.manager.report(limited.id).supervision.reason, /执行期限/);
+  g.advance(60000);
+  assert.equal(g.children.length, 1);
+});
+test("reported usage threshold requests a stop once and never retries the budget stop", (t) => {
+  const f = fixture(t),
+    first = f.manager.dispatch("codex", "bounded", "work", {
+      contract: { checks: [], tokenLimit: 12 },
+    });
+  f.event(0, {
+    type: "turn.completed",
+    usage: { input_tokens: 10, output_tokens: 3 },
+  });
+  assert.equal(f.manager.task(first.id).status, "attention");
+  assert.match(f.manager.task(first.id).error, /Token 阈值/);
+  assert.match(f.manager.report(first.id).supervision.reason, /Token 阈值/);
+  f.children[0].emit("close", 0);
+  f.advance();
+  assert.equal(f.children.length, 1);
+  assert.equal(f.manager.report(first.id).usage.total, 13);
 });
 test("unknown errors and login failures stop without retry or changing tool", (t) => {
   for (const error of ["unrecognized task failure", "401 unauthorized"]) {

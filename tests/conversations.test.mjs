@@ -8,6 +8,12 @@ import { createState } from "../electron/state.mjs";
 
 test("legacy messages and tasks migrate; new chats isolate context and survive restart", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bobo-conversations-"));
+  const previous = process.env.BOBO_ENV_PATH;
+  process.env.BOBO_ENV_PATH = path.join(dir, ".env");
+  fs.writeFileSync(
+    process.env.BOBO_ENV_PATH,
+    "OPENAI_API_KEY=\nMODEL_HUB_AK=\nBOBO_WORKSPACE=\n",
+  );
   try {
     const legacy = createState();
     legacy.messages.push({
@@ -47,6 +53,8 @@ test("legacy messages and tasks migrate; new chats isolate context and survive r
       "第二段独立需求",
     );
   } finally {
+    if (previous === undefined) delete process.env.BOBO_ENV_PATH;
+    else process.env.BOBO_ENV_PATH = previous;
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
